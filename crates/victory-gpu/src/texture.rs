@@ -212,21 +212,25 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// For textures shaders reach through the heap itself, at submission
 /// (`crate::bindless::uploads`): brings the staging buffer up to date and
 /// records its copy into `list` only if the memory changed since (or was
-/// never uploaded). True if it recorded; the texture is then in the copy
-/// destination state.
-pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
+/// never uploaded). The bytes of the copy, if it recorded; the texture is
+/// then in the copy destination state.
+pub(crate) fn upload_changed(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+) -> Option<u64> {
     if is_host_written(resource) {
-        return false;
+        return None;
     }
     let Some(staging) = staging(resource, texture) else {
-        return false;
+        return None;
     };
     if !staging.refresh() {
-        return false;
+        return None;
     }
     record(list, resource, texture, &staging);
     list.keep(&staging.buffer);
-    true
+    Some(staging.size)
 }
 
 /// Records the copy of every subresource of `staging` into `texture`,

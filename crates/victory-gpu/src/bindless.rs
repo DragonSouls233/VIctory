@@ -10,8 +10,8 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -182,6 +182,35 @@ fn left_kind(view: &View) -> usize {
     }
 }
 
+/// Bytes of texture copies one submission records by default; the rest of a
+/// longer queue waits for the next submission (`VICTORY_UPLOAD_MB`, `0` for
+/// no limit).
+///
+/// A world frame can leave thousands of slots waiting for upload (the City
+/// capture averaged 391 MB a frame after a save reload). Detiling all of
+/// them in one submission spends hundreds of milliseconds of CPU before the
+/// GPU sees anything, and the frame it lands in is the one the player
+/// notices; a piece at a time keeps frames even and the visible world still
+/// arrives within a fraction of a second (DexNom/VIctory's texture queue
+/// serves the same problem the same way).
+fn upload_budget() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mb = std::env::var("VICTORY_UPLOAD_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(32);
+        mb << 20
+    })
+}
+
+/// The positions of a queue of `len`, from where the last submission
+/// stopped, wrapping: one submission serves a piece of a long queue.
+fn window(len: usize, next: usize) -> impl Iterator<Item = usize> {
+    let start = if len == 0 { 0 } else { next % len };
+    (0..len).map(move |k| (start + k) % len.max(1))
+}
+
 /// At submission, before anything else of it: the textures the heaps of its
 /// heap-indexing lists view are brought up to date, those whose title
 /// memory changed copied into their host textures by a list of ours, which
@@ -191,6 +220,8 @@ fn left_kind(view: &View) -> usize {
 /// submission shows from the next one on.
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
+    /// Where the last submission stopped in an ordered queue of slots.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
     match &guard.0 {
@@ -200,26 +231,52 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         None => guard.0 = Some(crate::host::host()?.new_list().ok()?),
     }
     let list = guard.0.as_ref()?;
-    let mut recorded = false;
-    let mut done = std::collections::HashSet::new();
+    // Every slot any heap views, newest title memory first: the textures a
+    // level has just made are the ones on screen.
+    let mut candidates: Vec<usize> = Vec::new();
     for viewed in heaps {
-        // Held while uploading: the title releasing a texture (and its
-        // memory) waits in `forget`.
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
-            if !done.insert(r) {
+        candidates.extend(inner.textures.keys().copied());
+    }
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    candidates.dedup();
+    let budget = upload_budget();
+    let len = candidates.len();
+    let start = NEXT.load(Relaxed);
+    let mut recorded = false;
+    let mut bytes = 0u64;
+    let mut served = 0usize;
+    let mut stopped = false;
+    for k in window(len, start) {
+        let r = candidates[k];
+        // Held while uploading: the title releasing a texture (and its
+        // memory) waits in `forget`, which takes the same lock.
+        for viewed in heaps {
+            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if !inner.textures.contains_key(&r) {
                 continue;
             }
-            let Some(texture) = crate::resource::host_resource(r as This) else {
-                continue;
-            };
-            if crate::texture::upload_changed(list, r as This, texture) {
+            if let Some(texture) = crate::resource::host_resource(r as This)
+                && let Some(n) = crate::texture::upload_changed(list, r as This, texture)
+            {
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
                 recorded = true;
+                bytes += n;
+                served += 1;
                 #[cfg(feature = "diagnostics")]
                 UPLOADED.fetch_add(1, Relaxed);
             }
+            break;
         }
+        if budget > 0 && bytes >= budget && served > 0 {
+            NEXT.store(start + k + 1, Relaxed);
+            stopped = true;
+            break;
+        }
+    }
+    // A queue that fit starts from the newest texture again next time.
+    if !stopped {
+        NEXT.store(0, Relaxed);
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
@@ -351,6 +408,34 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::s;
+
+    /// A queue longer than a submission's budget is served a piece at a
+    /// time, from where the last one stopped, and nothing is skipped.
+    #[test]
+    fn a_queue_is_served_in_pieces_without_skipping_a_slot() {
+        assert_eq!(window(0, 7).count(), 0);
+        assert_eq!(window(4, 0).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(window(4, 2).collect::<Vec<_>>(), [2, 3, 0, 1]);
+        assert_eq!(window(4, 9).collect::<Vec<_>>(), [1, 2, 3, 0]);
+        // From any start, a full pass covers the whole queue once.
+        for start in 0..7 {
+            let mut seen = vec![0u32; 5];
+            for k in window(5, start) {
+                seen[k] += 1;
+            }
+            assert!(seen.iter().all(|&n| n == 1), "start {start}: {seen:?}");
+        }
+        // And a submission resuming where the last stopped picks up next.
+        let mut cursor = 0;
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            for k in window(5, cursor).take(2) {
+                order.push(k);
+                cursor += 1;
+            }
+        }
+        assert_eq!(order, [0, 1, 2, 3, 4, 0], "no slot is skipped");
+    }
 
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
     /// slot 1 (raw unordered buffer): through a table over the heap's
