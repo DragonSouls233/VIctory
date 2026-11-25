@@ -1005,6 +1005,11 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // Whether the device was already gone before this submission: then
+        // the commands that removed it are the *last* submission's, which
+        // `last_submit` prints, not these.
+        // SAFETY: a plain query.
+        let removed_before = unsafe { self.device.GetDeviceRemovedReason() }.is_err();
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -1069,7 +1074,7 @@ impl Host {
                 tracing::warn!(dred = dred_on(), ?counts, "device removed: commands noted per list");
             }
             fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}{}",
+                "host GPU device removed after a submission of {} lists (already gone before it: {removed_before}){}{}{}{}",
                 runs.len(),
                 self.removal_data(runs),
                 last_notes(runs),
@@ -1360,6 +1365,11 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            // The call returns nothing: a view the host would not take
+            // shows only as a device it removed (`0x887A0001`).
+            if self.device.GetDeviceRemovedReason().is_err() {
+                crate::descriptor::host::refused("rtv", handle);
+            }
             handle
         }
     }
@@ -1386,6 +1396,9 @@ impl Host {
             handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
+            if self.device.GetDeviceRemovedReason().is_err() {
+                crate::descriptor::host::refused("dsv", handle);
+            }
             handle
         }
     }
@@ -2655,6 +2668,15 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            // Noted: this list is the one a device-removed report would
+            // otherwise print as empty (`counts=[0]`).
+            #[cfg(feature = "diagnostics")]
+            p.copy.note_op(|| {
+                format!(
+                    "present {width}x{height} f{} of {:#x} from state {:#x}",
+                    format.0, desc.Width, state.0
+                )
+            });
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -2919,29 +2941,43 @@ fn last_notes(runs: &[&HostList]) -> String {
 /// A list that recorded an invalid command has usually been reset (its own
 /// notes cleared) by the time the GPU runs into it and removes the device:
 /// the submission that reports the removal is the next one, often empty.
+/// The host's removals also arrive while the title does other work (a few
+/// seconds of copying buffers to their host copies, say), so the *last*
+/// submission before the report is often the present's copy: every
+/// submission of the last few is kept, the title's lists among them.
 #[cfg(feature = "diagnostics")]
-static LAST_SUBMIT: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+static LAST_SUBMIT: Mutex<std::collections::VecDeque<Vec<Vec<String>>>> = Mutex::new(std::collections::VecDeque::new());
 
-/// Keeps the last `MOST` commands of each list of a submission that ran.
+/// Keeps the last `MOST` commands of each list of a submission that ran, for
+/// the last [`SUBMISSIONS`] submissions.
 #[cfg(feature = "diagnostics")]
 fn remember(runs: &[&HostList]) {
     const MOST: usize = 8;
+    const SUBMISSIONS: usize = 4;
     let mut last = LAST_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
-    last.clear();
+    let mut lists = Vec::new();
     for l in runs {
         let notes = l.notes.lock().unwrap_or_else(|e| e.into_inner());
-        last.push(notes.iter().rev().take(MOST).rev().map(|(n, _)| n.clone()).collect());
+        lists.push(notes.iter().rev().take(MOST).rev().map(|(n, _)| n.clone()).collect());
     }
+    if last.len() == SUBMISSIONS {
+        last.pop_front();
+    }
+    last.push_back(lists);
 }
 
-/// The commands of the last submission, for the report.
+/// The commands of the last few submissions, oldest first, for the report.
 #[cfg(feature = "diagnostics")]
 fn last_submit() -> String {
     let last = LAST_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+    let n = last.len();
     let mut text = String::new();
-    for (i, notes) in last.iter().enumerate() {
-        for n in notes {
-            text.push_str(&format!("; last submission list {i} ended with: {n}"));
+    for (k, lists) in last.iter().enumerate() {
+        let ago = n - 1 - k;
+        for (i, notes) in lists.iter().enumerate() {
+            for note in notes {
+                text.push_str(&format!("; submission -{ago} list {i} ended with: {note}"));
+            }
         }
     }
     text

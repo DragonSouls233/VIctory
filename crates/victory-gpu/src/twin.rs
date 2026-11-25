@@ -302,6 +302,9 @@ pub(crate) fn uav(
     let desc = unsafe { std::ptr::from_ref(&words).cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned() };
     // SAFETY: a live texture and a slot of our heap.
     unsafe { host()?.device.CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at) };
+    // The call returns nothing: the first view made after the host removed
+    // the device is the one it named.
+    crate::descriptor::host::made("twin uav", at);
     Some(texture.texture.clone())
 }
 

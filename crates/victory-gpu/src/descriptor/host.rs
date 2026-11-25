@@ -799,6 +799,37 @@ macro_rules! once {
     }};
 }
 
+/// Logs a view the host refused. The call that makes it leaves the device
+/// removed (`0x887A0001`), which the next submission then finds with no
+/// word as to which descriptor it was: the title only sees a device that
+/// went away. The first few name the kind and the slot.
+pub(crate) fn refused(kind: &str, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 200 {
+        tracing::warn!(
+            kind,
+            at = format_args!("{:#x}", at.ptr),
+            "the host refused a descriptor view (the device is removed)"
+        );
+    }
+}
+
+/// [`refused`] after a view was made: the host's `Create*View` calls return
+/// nothing, so a view it would not take shows only as a device it removed.
+pub(crate) fn made(what: &str, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if GONE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(host) = host() else { return };
+    // SAFETY: a plain query.
+    if unsafe { host.device.GetDeviceRemovedReason() }.is_err() {
+        GONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        refused(what, at);
+    }
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -979,6 +1010,23 @@ fn buffer_srv(
     };
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !shadow.offset(start).is_multiple_of(16) {
+        // The host takes a raw view only from a 16-byte boundary, the
+        // console from any 4: `CreateShaderResourceView` refuses the call
+        // and leaves the device removed (`0x887A0001`). A slot that reads
+        // zeros is wrong where this view is right; a removed device is
+        // wrong everywhere.
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(
+            address = format_args!("{start:#x}"),
+            offset = shadow.offset(start),
+            first,
+            count,
+            "raw buffer view not on 16 bytes of its host copy"
+        );
+        once!(first, count, "raw buffer view not on 16 bytes of its host copy");
+        return None;
+    }
     if !in_buffer(&shadow.buffer, first, count, element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -993,6 +1041,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    made("buffer srv", at);
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1043,16 +1092,32 @@ fn buffer_uav(
     buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 && !shadow.offset(start).is_multiple_of(16) {
+        // As [`buffer_srv`]: the host refuses a raw view off a 16-byte
+        // boundary and removes the device.
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(
+            address = format_args!("{start:#x}"),
+            offset = shadow.offset(start),
+            first,
+            count,
+            "raw unordered buffer view not on 16 bytes of its host copy"
+        );
+        once!(first, count, "raw unordered buffer view not on 16 bytes of its host copy");
+        return None;
+    }
     if !in_buffer(&shadow.buffer, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
+    // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
+    made("buffer uav", at);
     MARK.with(|m| m.set(shadow.mark_entry(start)));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
@@ -1226,6 +1291,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
+                made("texture srv", at);
                 Some(Some((texture.clone(), None)))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -1268,6 +1334,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
+            made("texture uav", at);
             Some(Some((texture.clone(), None)))
         }
         View::Sampler(words) => {

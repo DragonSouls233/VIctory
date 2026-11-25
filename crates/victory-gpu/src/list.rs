@@ -447,6 +447,12 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        // Noted: a submission of only these is otherwise a blank list in
+        // the device-removed report (`counts=[0]`), which says nothing.
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!("copy buffer {len:#x} from {src_offset:#x} to {dst_offset:#x}")
+        });
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
