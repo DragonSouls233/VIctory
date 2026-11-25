@@ -1069,13 +1069,15 @@ impl Host {
                 tracing::warn!(dred = dred_on(), ?counts, "device removed: commands noted per list");
             }
             fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
+                "host GPU device removed after a submission of {} lists{}{}{}{}",
                 runs.len(),
                 self.removal_data(runs),
                 last_notes(runs),
+                last_submit(),
                 removed_during(runs, removed_in)
             ));
         }
+        remember(runs);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -2912,6 +2914,46 @@ fn last_notes(runs: &[&HostList]) -> String {
         String::new()
     }
 }
+
+/// The last submission's commands, per list, for the device-removed report.
+/// A list that recorded an invalid command has usually been reset (its own
+/// notes cleared) by the time the GPU runs into it and removes the device:
+/// the submission that reports the removal is the next one, often empty.
+#[cfg(feature = "diagnostics")]
+static LAST_SUBMIT: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+
+/// Keeps the last `MOST` commands of each list of a submission that ran.
+#[cfg(feature = "diagnostics")]
+fn remember(runs: &[&HostList]) {
+    const MOST: usize = 8;
+    let mut last = LAST_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+    last.clear();
+    for l in runs {
+        let notes = l.notes.lock().unwrap_or_else(|e| e.into_inner());
+        last.push(notes.iter().rev().take(MOST).rev().map(|(n, _)| n.clone()).collect());
+    }
+}
+
+/// The commands of the last submission, for the report.
+#[cfg(feature = "diagnostics")]
+fn last_submit() -> String {
+    let last = LAST_SUBMIT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = String::new();
+    for (i, notes) in last.iter().enumerate() {
+        for n in notes {
+            text.push_str(&format!("; last submission list {i} ended with: {n}"));
+        }
+    }
+    text
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn last_submit() -> String {
+    String::new()
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn remember(_: &[&HostList]) {}
 
 /// Where the faulting address `va` lies against a range `(start, bytes)` a
 /// command reads (diagnostics).
