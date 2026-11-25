@@ -186,7 +186,17 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The default adapter of a Remote Desktop session is its Remote
+            // Display Adapter, which refuses the resource calls here
+            // (see `best_adapter`). The machine's own card is named instead.
+            match best_adapter() {
+                Some((adapter, name)) => {
+                    let adapter: IDXGIAdapter = adapter.cast()?;
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    tracing::info!(adapter = %name, "host device on the adapter with the most memory");
+                }
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -277,6 +287,48 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
+    }
+}
+
+/// The hardware adapter with the most dedicated memory, and its name.
+///
+/// `D3D12CreateDevice(None, …)` takes the session's default adapter, which
+/// on a Remote Desktop session is `Microsoft Remote Display Adapter`: that
+/// one answers `DXGI_ERROR_UNSUPPORTED` (0x887A0004) to the resource calls
+/// this layer makes (`CreateCommittedResource3` with castable formats first
+/// of all), and the run ends with "host GPU device removed" a second later.
+/// The machine's own card is there all along, so name it.
+fn best_adapter() -> Option<(IDXGIAdapter1, String)> {
+    // SAFETY: plain DXGI factory and adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut best: Option<(IDXGIAdapter1, String, usize)> = None;
+        for i in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(i) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let len = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            // The adapters a remote session adds: no GPU behind them.
+            if name.contains("Remote Display") || name.contains("Basic Render") {
+                continue;
+            }
+            let memory = desc.DedicatedVideoMemory;
+            if best.as_ref().is_none_or(|b| memory > b.2) {
+                best = Some((adapter, name, memory));
+            }
+        }
+        best.map(|(adapter, name, _)| (adapter, name))
     }
 }
 
@@ -1109,6 +1161,14 @@ impl Host {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
                     text.push_str(&format!("; no breadcrumbs ({e})"));
+                    // DRED is off unless the device was made with it, and the
+                    // debug interface it needs is not there without the
+                    // Graphics Tools feature: the breadcrumb walk gives
+                    // nothing at all then, while the lists still hold the
+                    // texts of the commands they noted (`VICTORY_D3D12_DRED`
+                    // records them). Those name the command a fault stopped
+                    // among, which is what the walk was for.
+                    text.push_str(&last_notes(runs));
                     return text;
                 }
             };
@@ -1118,6 +1178,15 @@ impl Host {
             while let Some(p) = node.as_ref() {
                 nodes.push(p);
                 node = p.pNext;
+            }
+            if nodes.is_empty() {
+                // Breadcrumbs are only recorded when the device was made with
+                // them, and that needs the debug layer's interface: without
+                // the Graphics Tools feature the walk answers nothing at all.
+                // The lists still hold the texts of the commands they noted.
+                text.push_str("; no breadcrumb nodes");
+                text.push_str(&last_notes(runs));
+                return text;
             }
             let index: Vec<Option<usize>> = nodes
                 .iter()
