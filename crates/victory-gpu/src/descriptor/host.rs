@@ -632,6 +632,19 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_from(index, handle, for_draw, None)
+    }
+
+    /// As [`Self::mirror`], but with the record's bytes already read through
+    /// the kernel by `super::sync_heaps`. A page the title unmapped while
+    /// syncing fails that read; reading the record in place here would fault.
+    pub(crate) fn mirror_from(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        record: Option<&[u8]>,
+    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -646,8 +659,17 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let word = |k: usize| {
+            record.and_then(|bytes| bytes.get(k..k + 4)).map(|bytes| {
+                u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]))
+            })
+        };
+        let [tag, i, generation] = match (word(0), word(4), word(8)) {
+            (Some(tag), Some(i), Some(generation)) => [tag, i, generation],
+            _ if record.is_some() => return None,
+            // SAFETY: the handle is a descriptor slot in title memory.
+            _ => unsafe { (handle as *const [u32; 3]).read_unaligned() },
+        };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());

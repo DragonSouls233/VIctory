@@ -24,6 +24,26 @@ mod bvh;
 
 type Why = &'static str;
 
+/// A first half of an interpolation whose result is read as data
+/// ([`Lower::interp`]).
+pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
+
+thread_local! {
+    /// Whether first halves are evaluated as the pair they start, on the
+    /// second translation of a program the first one refused for it.
+    static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with first halves of interpolations evaluated as the
+/// pair they start. Only programs refused with [`FIRST_HALF`] are retried
+/// this way: enabling it for every program changes working ones.
+pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_HALF_PAIRS.replace(true);
+    let result = translate();
+    FIRST_HALF_PAIRS.set(before);
+    result
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -606,7 +626,26 @@ impl<'a> Lower<'a> {
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
-            interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            interps: {
+                let mut m: HashMap<Site, &Interp> =
+                    x.io.interps.iter().map(|(s, i)| (*s, i)).collect();
+                // A first half whose result is also read as data is evaluated
+                // as the pair it starts, but only on the retry of a program
+                // the plain translation refused for it. `VICTORY_FIRST_HALF=0`
+                // keeps the old refusal.
+                if FIRST_HALF_PAIRS.get()
+                    && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0")
+                {
+                    for (_, i) in &x.io.interps {
+                        if let Interp::Interpolated { first, .. } = i {
+                            for s in first {
+                                m.entry(*s).or_insert(i);
+                            }
+                        }
+                    }
+                }
+                m
+            },
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -4056,6 +4095,16 @@ impl<'a> Lower<'a> {
                 .filter(|&(s, a)| *s != site && address.is_some_and(|b| same(a, b)))
                 .find_map(|&(s, _)| use_of(s))
         });
+        // A descriptor nothing uses as one, but whose dwords the code reads as
+        // numbers: infer the view kind from the load itself.
+        let unused = if use_at.is_none() {
+            self.unused_descriptor_kind(inst, site, code, count)
+        } else {
+            None
+        };
+        let (first, props, image, uav, _used) = if let Some(kind) = unused {
+            kind
+        } else {
         let Some((at, first)) = use_at else {
             return self.view_addresses(inst, site, code, count);
         };
@@ -4112,6 +4161,9 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        (first, props, image, uav, used)
+        };
+        let src = Source::Loaded { load: site, first };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4176,6 +4228,59 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// What [`Self::descriptor_data`] makes of a descriptor load that nothing
+    /// uses as a descriptor but whose dwords the code reads: the first dword,
+    /// the handle properties, the image kind (none for a buffer), whether it
+    /// is an unordered view, and its used-resource entry. An image's eight
+    /// dwords are read as a 2D texture's; a buffer's four as a raw view's
+    /// where the code reads its record count.
+    // shortcut: an image whose kind nothing tells is taken for a 2D texture:
+    // the title reads texel sizes of 2D textures (puddle and shadow masks).
+    #[allow(clippy::type_complexity)]
+    fn unused_descriptor_kind(
+        &self,
+        inst: &Inst,
+        site: Site,
+        code: u8,
+        count: u32,
+    ) -> Option<(u8, (u32, u32), Option<u32>, bool, Option<&'a UsedResource>)> {
+        if self.x.res.descriptors.iter().any(|d| {
+            d.role == Role::Sampler
+                && d.source.leaves().into_iter().any(|l| {
+                    matches!(*l, Source::Loaded { load, .. } if load == site)
+                })
+        }) {
+            return None;
+        }
+        let used = self.used_kind(&Source::Loaded { load: site, first: 0 });
+        if used.is_some_and(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+            return None;
+        }
+        let read = |k: u32| {
+            inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                self.x
+                    .p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.reads.iter().any(|r| r.1 == v))
+            })
+        };
+        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let u = if uav { 0x1000 } else { 0 };
+        match count {
+            // width (dwords 1-2), height (2), levels (3), depth (4)
+            8 if (1..5).any(read) && used.is_none_or(|u| u.dwords == 8) => {
+                Some((0, (2 | u, 0x409), Some(2), uav, used))
+            }
+            // the record count
+            4 if read(2) && used.is_none_or(|u| u.dwords == 4) => {
+                Some((0, (11 | u, 0), None, uav, used))
+            }
+            _ => None,
+        }
     }
 
     /// `s_load_dword*` from the root signature's memory: user-data dwords.
@@ -7404,7 +7509,24 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            // The second half interpolates the attribute itself, so a first
+            // half no one reads as data needs no value. An f16 second half
+            // that writes the high half of this register keeps the low half
+            // as it was, though: give it a defined zero.
+            let name = inst.name();
+            if name == "v_interp_p1_f32" || name == "v_interp_p1ll_f16" {
+                let dst = match &inst.fields {
+                    Fields::Vintrp { dst, .. } => Some(*dst),
+                    Fields::Valu(v) => v.dst,
+                    _ => None,
+                };
+                if let Some(Operand::Vector { reg, .. }) = dst {
+                    let zero = self.s.m.i32(0);
+                    self.write(inst, Reg::V(reg), zero, None);
+                    return Ok(());
+                }
+            }
+            return Err(FIRST_HALF);
         };
         let (attribute, mode) = match interp {
             Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {

@@ -366,7 +366,21 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// [`translate`] made as `options` say.
+///
+/// A program refused because the first half of an interpolation is read as
+/// data is translated once more with those halves evaluated as the pair they
+/// start, and only such a program: enabling it everywhere changes programs
+/// that already translate.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    match translate_plain(container, options) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| translate_plain(container, options))
+        }
+        other => other,
+    }
+}
+
+fn translate_plain(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -1293,10 +1307,10 @@ mod tests {
         };
         program(0x7E08_1702).unwrap(); // v_cvt_f32_f16 v4, v2
         program(0x3408_0490).unwrap(); // v_lshlrev_b32 v4, 16, v2
-        let whole = program(0x7E08_0302).unwrap_err(); // v_mov_b32 v4, v2
-        assert!(whole.to_string().contains("first half"), "{whole}");
-        let part = program(0x3408_0488).unwrap_err(); // v_lshlrev_b32 v4, 8, v2
-        assert!(part.to_string().contains("first half"), "{part}");
+        // A whole or partial read of the first half is retried with the
+        // pair's value; VICTORY_FIRST_HALF=0 keeps the old refusal.
+        program(0x7E08_0302).unwrap(); // v_mov_b32 v4, v2
+        program(0x3408_0488).unwrap(); // v_lshlrev_b32 v4, 8, v2
     }
 
     /// A pixel export before the `done` one, both under a lane guard (EXEC

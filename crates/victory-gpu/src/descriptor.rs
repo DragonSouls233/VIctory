@@ -171,18 +171,34 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // Capped host heaps have no counterparts for the title's per-draw
+        // table slots; raw writes there must not be mirrored.
+        let mirrored_count = heap.desc.count.min(host.count());
+        let mut page_bytes: Vec<u8> = Vec::new();
         for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
+            // By page: read the whole changed range through the kernel into
+            // a copy. A page the title unmaps in between then fails the read
+            // instead of faulting on the thousands of in-place record reads.
             let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                page_bytes.resize(end - page, 0);
+                if !crate::host::read_into(page as *const u8, &mut page_bytes) {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
+                let (first, last) =
+                    ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                for index in first..last.min(u64::from(mirrored_count)) {
+                    let handle = start + index * step;
+                    // A record straddling the range's ends is left to the
+                    // range holding its first byte.
+                    let Some(at) = (handle as usize).checked_sub(page) else {
+                        continue;
+                    };
+                    let Some(record) = page_bytes.get(at..at + step as usize) else {
+                        continue;
+                    };
+                    host.mirror_from(index as u32, handle, false, Some(record));
                 }
             }
         }

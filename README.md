@@ -194,6 +194,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_PIPELINE_WAIT_MS=<n>` | wait at most `n` milliseconds per frame for pipelines still being built (default `500`; `0` never waits) |
 | `VICTORY_DEPTH_BOUNDS=0` | leave the depth bounds test out even where the host supports it (the title's `OMSetDepthBounds` is then ignored) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_FIRST_HALF=0` | do not retry a program refused for reading the first half of an interpolation as data; by default that program is translated once more with first halves evaluated as the pair they start |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
