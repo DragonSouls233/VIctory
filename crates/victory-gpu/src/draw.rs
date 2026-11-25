@@ -918,6 +918,43 @@ impl State {
         }
     }
 
+    /// After a dispatch of `p`: the least indirect light, if it is the
+    /// program that resolves that (`crate::ambient`). Whether it recorded
+    /// anything: the list's bindings are then ours.
+    fn ambient(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        let lit = crate::ambient::raise(list, light as This);
+        if lit {
+            // The pass set a pipeline, a root signature and a heap of its
+            // own: the title's go back on before anything else runs.
+            (self.host_pipeline, self.host_heaps, self.host_roots) =
+                (0, [usize::MAX; 2], [0; 2]);
+            list.need_rebind();
+        }
+        lit
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
@@ -954,6 +991,9 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
+        // The resolve of the title's indirect light leaves nothing usable
+        // while rays do not run: what it wrote is replaced.
+        self.ambient(list, p);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 

@@ -2922,11 +2922,20 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// Whether a quad-local read must reach discarded lanes: after a pixel's
-    /// discard they are the host's helpers, which only quad reads see (wave
-    /// reads give 0 from them on AMD).
+    /// Whether quad-local reads must reach helper lanes: in a pixel shader
+    /// that is always the case, and after a discard they are the host's
+    /// helpers, which only quad reads see (wave reads give 0 from them on
+    /// AMD).
+    ///
+    /// A quad read that takes the wave path at a triangle's edge reads a
+    /// helper lane, and gets 0: a derivative taken by hand (`quad_perm`)
+    /// was the whole value there, the texture read that used it took its
+    /// smallest level, and triangle edges showed as lines on car paint,
+    /// glass and skin (two forks found this apart: Belobug's
+    /// `VICTORY-AMD` and `VItoriaBr`). Upstream does it after discards
+    /// only; `VICTORY_QUAD_HELPERS=0` keeps that.
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel && !self.x.st.discards.is_empty()
+        quad && self.s.pixel && (quad_helpers() || !self.x.st.discards.is_empty())
     }
 
     /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
@@ -10026,6 +10035,18 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether a pixel shader's quad reads go through quad reads everywhere,
+/// helper lanes included (`VICTORY_QUAD_HELPERS=0`: only after a discard,
+/// as upstream does). Read once for the run.
+fn quad_helpers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_QUAD_HELPERS")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
 }
 
 #[cfg(test)]

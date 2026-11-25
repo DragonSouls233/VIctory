@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -31,9 +32,10 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Where the search for free dynamic slots starts, which are taken (by
+    /// lists not yet reset), and the smallest run known not to be free
+    /// since the last release (`usize::MAX`: none).
+    next: Mutex<(u32, Vec<bool>, usize)>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -89,9 +91,15 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
+///
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
-const DYNAMIC: u32 = 1 << 18;
+/// each a device removal shortly after; #59). 2^18 still did for Belobug: a
+/// world frame of some 7,000 draws held over 400,000 of these, and tables of
+/// 150 slots no longer fit, so the draws that needed them were dropped (the
+/// subsurface resolve, tree imposters: their surfaces were missing). The
+/// title's own heap has 1,245,184 slots; `victory_shader::emit::HEAP_VIEWS`
+/// is these and those.
+const DYNAMIC: u32 = 1 << 20;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
@@ -194,7 +202,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
@@ -299,8 +307,26 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let (next, taken, no_run) = &mut *guard;
         let n = n as usize;
+        // A search that found no run of this size (or of a smaller one)
+        // since the last release finds none now: without this, each table of
+        // a frame that does not fit walked every slot again, and a heavy
+        // place took 7 to 11 seconds a frame (Belobug's runs sw1, sw2).
+        if n >= *no_run {
+            return None;
+        }
+        // Releases come all the time and each allows a search again: no
+        // more than a few failed walks a frame.
+        static FAILED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        const WALKS: u64 = 8;
+        let frame = crate::queue::presented();
+        if FAILED[0].swap(frame, Ordering::Relaxed) != frame {
+            FAILED[1].store(0, Ordering::Relaxed);
+        }
+        if FAILED[1].load(Ordering::Relaxed) >= WALKS {
+            return None;
+        }
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
         let cursor = *next as usize;
@@ -325,6 +351,8 @@ impl HostHeap {
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            *no_run = n;
+            FAILED[1].fetch_add(1, Ordering::Relaxed);
             return None;
         };
         taken[first..first + n].fill(true);
@@ -381,6 +409,7 @@ impl HostHeap {
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
         }
+        guard.2 = usize::MAX;
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the

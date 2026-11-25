@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Whether this is one of the programs that resolve the title's
+    /// ray-traced indirect light (`crate::ambient`).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -91,6 +95,10 @@ impl Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
+            #[cfg(windows)]
+            resolves_light: bytes
+                .windows(crate::ambient::PROGRAM.len())
+                .any(|w| w == crate::ambient::PROGRAM),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }

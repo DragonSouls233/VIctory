@@ -21,8 +21,11 @@ pub const VIEW_STRIDES: u8 = 255;
 pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// indices"). The view heap holds the title's 1,245,184 slots, then the
+/// dynamic ones `victory-gpu` keeps for per-draw tables (1,048,576, see
+/// `victory-gpu`'s `DYNAMIC`: 2^18 ran out in a world frame of 7,000
+/// draws), then a few.
+pub const HEAP_VIEWS: u32 = 2_294_784;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
