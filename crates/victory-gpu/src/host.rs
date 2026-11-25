@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -32,9 +32,48 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
-const RTV_RING: u32 = 1024;
+/// Render target, depth and CPU-only views live until the command naming
+/// them has **run**, not until it is recorded: a host list is recorded over
+/// a frame and submitted at its end, so a ring smaller than a frame's views
+/// would overwrite the slots of commands still to run. D3D12 leaves that
+/// undefined, and the driver answers it by removing the device
+/// (`0x887A0001` right after a submission, 2026-11-25 22:26, the frame its
+/// draws passed 383).
+///
+/// 1024 was enough while a frame had a few hundred draws; the world's
+/// 7,000-draw frames (Belobug's runs) and several targets a draw need more.
+/// A frame's slots are used once each: the ring only has to be larger than
+/// a frame's views, since a submission is waited for before the next frame
+/// starts.
+const RTV_RING: u32 = 1 << 16;
+
+/// Whether a frame's views filled the ring: the frame's commands then name
+/// slots that later commands in it overwrote (logged once a frame does).
+fn ring_overflow(frame: u64, used: u32) {
+    tracing::warn!(
+        frame,
+        used,
+        ring = RTV_RING,
+        "a frame's render target views filled the descriptor ring: its earlier commands name slots later ones overwrote"
+    );
+}
+
+/// The next slot of the ring behind `next`, counting the frame's views for
+/// [`ring_overflow`].
+fn ring_slot(next: &AtomicU32) -> u32 {
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static USED: AtomicU32 = AtomicU32::new(0);
+    let slot = next.fetch_add(1, Ordering::Relaxed);
+    let frame = crate::queue::presented();
+    if FRAME.swap(frame, Ordering::Relaxed) != frame {
+        USED.store(0, Ordering::Relaxed);
+    }
+    let n = USED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > RTV_RING && n - 1 <= RTV_RING {
+        ring_overflow(frame, n);
+    }
+    slot % RTV_RING
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -1018,6 +1057,17 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            #[cfg(feature = "diagnostics")]
+            {
+                // Whether the lists noted their commands at all: the report
+                // below prints them, and an empty count means the notes were
+                // never made (device-removed data off) rather than lost.
+                let counts: Vec<usize> = runs
+                    .iter()
+                    .map(|l| l.notes.lock().unwrap_or_else(|e| e.into_inner()).len())
+                    .collect();
+                tracing::warn!(dred = dred_on(), ?counts, "device removed: commands noted per list");
+            }
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
@@ -1301,7 +1351,7 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let slot = ring_slot(&self.next_rtv);
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
@@ -1314,7 +1364,7 @@ impl Host {
 
     /// A slot of CPU-only views, valid until it is recorded.
     pub(crate) fn cpu_view(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_cpu_view.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let slot = ring_slot(&self.next_cpu_view);
         // SAFETY: a live heap.
         let mut handle = unsafe { self.cpu_views.GetCPUDescriptorHandleForHeapStart() };
         handle.ptr += (slot * self.cpu_view_size) as usize;
@@ -1327,7 +1377,7 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let slot = ring_slot(&self.next_dsv);
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
             let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
@@ -1654,6 +1704,12 @@ impl HostList {
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            // The last few are what the device-removed report prints: a list
+            // of barriers and clears reaches far past any useful count.
+            const MOST: u32 = 1 << 16;
+            if at >= MOST {
+                return;
+            }
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };

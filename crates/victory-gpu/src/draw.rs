@@ -64,6 +64,12 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Whether a render target or the depth the title set has no host view:
+    /// a draw then is not recorded (`OMSetRenderTargets` would name fewer
+    /// views than the pipeline's `NumRenderTargets`, which the device
+    /// answers by removing itself, `0x887A0001`). Cleared by the next
+    /// `set_targets` that resolves them all.
+    targets_bad: bool,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -322,6 +328,7 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.targets_bad = false;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -329,9 +336,15 @@ impl State {
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
                 );
+                self.targets_bad = true;
                 continue;
             };
             let Some(texture) = crate::resource::host_resource(record.resource) else {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "a render target's texture is gone: draws to it are not recorded"
+                );
+                self.targets_bad = true;
                 continue;
             };
             self.targets.push(record.resource as usize);
@@ -347,7 +360,28 @@ impl State {
             crate::capture::note_target(list, record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        if dsv.is_none() && depth != 0 {
+            once!(
+                handle = format_args!("{depth:#x}"),
+                "a depth buffer's texture is gone: draws to it are not recorded"
+            );
+            self.targets_bad = true;
+        }
+        // As many views as the title named: the pipeline's `NumRenderTargets`
+        // counts on it, and one missing is an invalid call at submission.
+        if rtvs.len() != handles.len() {
+            self.targets_bad = true;
+        }
         // SAFETY: an open list; the views were just made.
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!(
+                "targets {} depth {:#x} (rtvs {})",
+                self.targets.len(),
+                self.depth,
+                rtvs.len()
+            )
+        });
         unsafe {
             list.list.OMSetRenderTargets(
                 rtvs.len() as u32,
@@ -436,6 +470,14 @@ impl State {
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             not_run("another kind of pipeline");
+            return false;
+        }
+        // A target the host could not make leaves `OMSetRenderTargets` with
+        // fewer views than the pipeline's `NumRenderTargets`: the device
+        // answers that at submission by removing itself.
+        if self.targets_bad {
+            once!(mesh, "a draw to a render target the host could not make: not recorded");
+            not_run("a render target without a host texture");
             return false;
         }
         if !self.bind(list, p, false) {
@@ -851,6 +893,8 @@ impl State {
                 heaps.insert(0, Some(h.heap.clone()));
             }
             heaps.iter().flatten().for_each(|h| list.keep(h));
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("descriptor heaps {} (memory {memory_heap})", heaps.len()));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { list.list.SetDescriptorHeaps(&heaps) };
             self.host_heaps = want;

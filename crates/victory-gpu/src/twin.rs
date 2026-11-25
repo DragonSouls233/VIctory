@@ -88,6 +88,26 @@ pub(crate) struct Use {
     depth: Arc<HostTexture>,
 }
 
+/// Whether depth textures get writable twins. `VICTORY_DEPTH_TWINS=0` turns
+/// them off: the material classifier's unordered writes are then dropped and
+/// only the first material is lit (Belobug's `VICTORY_DEPTH_TWINS`, which
+/// turned them off while the lit picture came out washed white).
+fn wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_none_or(|v| v != "0"))
+}
+
+/// Whether the console's 32-bit depth formats get twins too. Belobug's twins
+/// cover the 16-bit depth with stencil only (118-120), the material
+/// classifier's target: a 32-bit depth twin takes the conversion path on
+/// every use of either plane, and the host removed the device right after
+/// three of them were made (2026-11-25 22:15, `0x887A0001`, console 19 and
+/// 118). Off unless `VICTORY_DEPTH_TWINS_32=1`.
+fn wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_DEPTH_TWINS_32"))
+}
+
 /// The twin's plane formats for a console depth format (resource or
 /// view format): 16- or 32-bit depth, then 8-bit stencil if it has one.
 /// `None` for 24-bit depth, whose host plane takes no unordered view.
@@ -97,9 +117,9 @@ fn plane_formats(console: u32) -> Option<&'static [u32]> {
     const R8: u32 = 60;
     match console {
         53 | 55 => Some(&[R16]),
-        39..=41 => Some(&[R32]),
+        39..=41 if wide() => Some(&[R32]),
         118..=120 => Some(&[R16, R8]),
-        19..=22 => Some(&[R32, R8]),
+        19..=22 if wide() => Some(&[R32, R8]),
         _ => None,
     }
 }
@@ -107,6 +127,10 @@ fn plane_formats(console: u32) -> Option<&'static [u32]> {
 /// The twin of the depth texture `depth`, whose title resource has format
 /// `console`; `None` if the host makes none.
 fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
+    if !wanted() {
+        once(console, 0, 0, "depth twins off (VICTORY_DEPTH_TWINS=0): its unordered writes are dropped");
+        return None;
+    }
     let host = host()?;
     let Some(formats) = plane_formats(console) else {
         once(console, 0, 0, "a depth texture of this format gets no writable twin: its unordered writes are dropped");

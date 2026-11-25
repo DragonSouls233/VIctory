@@ -83,10 +83,13 @@
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
 //! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
-//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
-//!   many slots, those past its own null, so an index past the heap (data
-//!   still wrong; the console would read whatever memory follows its heap)
-//!   reads nothing instead of faulting the device.
+//!   (samplers [`HEAP_SAMPLERS`] − 1): every host heap is that large, the
+//!   slots past the title's own null, so an index past the heap (data still
+//!   wrong; the console would read whatever memory follows its heap) reads
+//!   nothing instead of an invalid call that removes the device. A host
+//!   whose limit ([`HEAP_VIEWS`], 1,000,000 descriptors) is smaller than the
+//!   title's heap (1,245,184 slots) mirrors the slots that fit and leaves
+//!   the rest null: those views read 0.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV

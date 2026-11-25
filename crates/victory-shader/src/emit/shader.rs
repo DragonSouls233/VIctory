@@ -19,13 +19,19 @@ pub const VIEW_STRIDES: u8 = 255;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices"). The view heap holds the title's 1,245,184 slots, then the
-/// dynamic ones `victory-gpu` keeps for per-draw tables (1,048,576, see
-/// `victory-gpu`'s `DYNAMIC`: 2^18 ran out in a world frame of 7,000
-/// draws), then a few.
-pub const HEAP_VIEWS: u32 = 2_294_784;
+/// Heap indices are clamped below these (views, samplers): every host heap
+/// is at least this large, and the slots the title does not fill are null
+/// (`emit`, "Heap indices").
+///
+/// `D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_1/2` is 1,000,000
+/// descriptors, so this cannot exceed it. The title's own heap has
+/// 1,245,184 slots, and a host heap that size is refused (`E_INVALIDARG`,
+/// then a removed call on a clamped index past the end). The view heap
+/// holds the title's slots that fit, then the dynamic ones `victory-gpu`
+/// keeps for per-draw tables, then the two null buffer views
+/// ([`NULL_BUFFER_VIEW`]). A title slot past the ones mirrored reads the
+/// null view: the console reads its own memory past them.
+pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that

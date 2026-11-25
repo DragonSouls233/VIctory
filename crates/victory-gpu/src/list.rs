@@ -408,6 +408,8 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("barrier {:#x} {before:#x} to {state:#x}", resource as usize));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -761,6 +763,8 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(texture, record.desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear render target {:#x}", record.resource as usize));
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -809,6 +813,8 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear depth {:#x} flags {flags}", record.resource as usize));
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

@@ -92,17 +92,21 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
 ///
+/// The host takes at most [`PORTABLE_VIEWS`] descriptors in a shader-visible
+/// heap, and the title's own heap is 1,245,184 slots, so on a host with that
+/// limit only part of the title's slots fit and the dynamic range is what is
+/// left over ([`MIN_DYNAMIC`]). This is the range to take when the title's
+/// heap leaves room for it.
+///
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
 /// each a device removal shortly after; #59). 2^18 still did for Belobug: a
 /// world frame of some 7,000 draws held over 400,000 of these, and tables of
 /// 150 slots no longer fit, so the draws that needed them were dropped (the
-/// subsurface resolve, tree imposters: their surfaces were missing). The
-/// title's own heap has 1,245,184 slots; `victory_shader::emit::HEAP_VIEWS`
-/// is these and those.
+/// subsurface resolve, tree imposters: their surfaces were missing).
 const DYNAMIC: u32 = 1 << 20;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// The least room kept for dynamic slots of a view heap, where the title's
+/// own slots take the rest.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
@@ -143,11 +147,19 @@ impl HostHeap {
                 Some((buffer, data as usize))
             })
             .flatten();
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
-        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
+        // Translated shaders clamp their heap indices below `HEAP_VIEWS` or
+        // `HEAP_SAMPLERS`, so the heap they index is at least that large: an
+        // index past the end of the heap the list has bound is not a null
+        // descriptor but an invalid call, which the device answers by
+        // removing itself (`0x887A0001`). So every view heap is
+        // `PORTABLE_VIEWS` slots whatever the title's size, laid out
+        //   [0, count)      the title's slots, as many as fit
+        //   [count, +extra) the dynamic slots per-draw tables take
+        //   the last two     the null buffer views
+        // The title's own heap has 1,245,184 slots against a host limit of
+        // 1,000,000, so on that host the last 311,000-odd read the null view.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        let title = count;
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -156,25 +168,35 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+            let total = PORTABLE_VIEWS.max(views);
+            // The last two slots are the null buffer views; one spare keeps
+            // `NULL_BUFFER_VIEW` strictly past the dynamic range's end.
+            let room = total.saturating_sub(3);
+            let extra = if title.saturating_add(DYNAMIC) <= room {
+                DYNAMIC
+            } else {
+                MIN_DYNAMIC.min(room)
+            };
+            let count = title.min(room - extra);
+            match make(total) {
+                Ok(heap) => (heap, count, extra),
+                Err(e) => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    tracing::warn!(error = %e, total, "no host view descriptor heap");
                     return None;
                 }
             }
         };
+        if title > count {
+            tracing::warn!(
+                title,
+                count,
+                total = count + extra + 3,
+                "the title's view heap is larger than the host's: the slots past {count} read the null view"
+            );
+        }
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
