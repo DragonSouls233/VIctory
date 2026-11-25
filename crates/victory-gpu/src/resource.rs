@@ -228,8 +228,18 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+///
+/// `B4G4R4A4_UNORM` (115) is the other one the console has and the PC does
+/// not: the title makes a 2560x1440 render target in it, and
+/// `CreateCommittedResource` answers `E_INVALIDARG` (0x80070057) for a
+/// render target in that format here — both with and without the castable
+/// formats — so the texture never exists and the commands that use it take
+/// the device down (`0x887A0001`, a submission later). `B5G5R5A1_UNORM` (86)
+/// is the same two bytes a texel with an alpha bit, and is a render target
+/// here: detiling and copies, which work in bytes, are unchanged.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        115 => 86,
         118 => 45,
         119 => 46,
         120 => 47,
