@@ -45,55 +45,34 @@ pub(crate) enum C {
     ProtectUs,
     WholeBytes,
     WholeUs,
-    /// Snapshots of ranges shaders write (bytes, time); page faults while
-    /// preparing submissions and while copying back.
-    SnapshotBytes,
-    SnapshotUs,
-    FaultsPrep,
-    FaultsBack,
-    /// Pages marked changed because a write landed on another mapping of
-    /// them.
-    AliasMarks,
-    /// Time in the guard handler; protection changes making pages read-only
-    /// (calls, pages) and giving write access back (pages).
-    HandlerUs,
-    ProtectCalls,
-    ProtectPages,
-    OpenPages,
-    /// Tracked pages written (distinct, per frame), and of those the ones
-    /// written the frame before too.
-    WrittenPages,
-    WrittenAgain,
-    /// In change checks: time asking the runtime for other mappings, and
-    /// waiting for the guard lock.
-    AliasUs,
-    GuardWaitUs,
-    /// Preparing submissions: refresh batches done (copies and change
-    /// checks); time in each kind of step (a step that flushes the batch
-    /// counts that too); texture uploads for heaps; state preludes.
-    FlushUs,
-    StepRefreshUs,
-    StepCopyUs,
-    StepWorkUs,
-    StepGpuWriteUs,
-    StepTextureUs,
-    StepHeapUs,
-    StepMemoryUs,
-    UploadsUs,
-    PreludeUs,
-    /// Copying back: bytes of copies compared with their snapshots, and
-    /// the time.
-    CompareBytes,
-    CompareUs,
-    /// Copying back pages shaders marked as written through views: pages
-    /// compared, bytes written back, the time; pages that kept the title's
-    /// bytes (it wrote them, their bytes from before unknown); pages whose
-    /// bytes the title's first write saved.
-    MarkedPages,
-    MarkedBytes,
-    MarkedUs,
-    MarkedKept,
-    SavedPages,
+    /// Submissions by how long the card was waited for (under 2 ms, 2-8,
+    /// 8-32, longer), and the microseconds waited in each class.
+    CardUnder2,
+    Card2To8,
+    Card8To32,
+    CardOver32,
+    CardUnder2Us,
+    Card2To8Us,
+    Card8To32Us,
+    CardOver32Us,
+    /// Submissions that hand nothing back to the title (no range shaders
+    /// write, no value written when done), and the microseconds the card
+    /// was waited for them.
+    NothingBack,
+    NothingBackUs,
+    /// Waits for every earlier shader write recorded into host lists: for
+    /// the title's barrier groups, for its barriers on buffers, and the
+    /// indirect commands bounded (each a dispatch of ours between two such
+    /// waits).
+    WaitsForGroups,
+    WaitsForBuffers,
+    IndirectBounded,
+    /// `watch::writes` kernel askings that failed (the range is not
+    /// write-watched: view memory or not watchable).
+    WatchFailed,
+    /// `watch::writes` askings not made because the range's first block is
+    /// already known to be guarded view memory (no kernel call).
+    WatchKnownView,
 }
 const COUNTERS: usize = 57;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -291,15 +270,132 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
-    let held: Vec<String> = crate::watch::held_times()
-        .iter()
-        .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
-        .collect();
-    tracing::info!("  guard lock held per frame: {}", held.join(", "));
-    let mut snapshots: Vec<((u64, u64), u64)> =
-        SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
-    snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
-    let snapshots: Vec<String> = snapshots
+    for ((src, len), (n, us)) in whole.into_iter().take(6) {
+        tracing::info!(
+            "  copied whole from {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            n as f64 / frames,
+            (len as u64 * n) as f64 / 1e6 / frames,
+            us as f64 / 1e3 / frames
+        );
+    }
+    // The waiting for the card: many short waits or a few long ones, how
+    // much of it is for submissions the title gets nothing back from, and
+    // the longest one.
+    let longest = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
+    tracing::info!(
+        "  waiting for the card per frame: {:.1} submissions under 2 ms ({:.1} ms), {:.1} of 2-8 ms \
+         ({:.1} ms), {:.1} of 8-32 ms ({:.1} ms), {:.1} longer ({:.1} ms); {:.1} submissions hand \
+         nothing back to the title ({:.1} ms of the waiting); the longest since the last line: \
+         {:.1} ms, {}",
+        c[C::CardUnder2 as usize],
+        ms(c[C::CardUnder2Us as usize]),
+        c[C::Card2To8 as usize],
+        ms(c[C::Card2To8Us as usize]),
+        c[C::Card8To32 as usize],
+        ms(c[C::Card8To32Us as usize]),
+        c[C::CardOver32 as usize],
+        ms(c[C::CardOver32Us as usize]),
+        c[C::NothingBack as usize],
+        ms(c[C::NothingBackUs as usize]),
+        longest.0 as f64 / 1e3,
+        longest.1
+    );
+    let by = WAITS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut by: Vec<_> = by.into_iter().flatten().collect();
+    by.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
+    for (what, (n, us)) in by.into_iter().take(12) {
+        tracing::info!(
+            "  the card's time by what ran: {:.1} ms a frame in {:.1} submissions a frame: {}",
+            us as f64 / 1e3 / frames,
+            n as f64 / frames,
+            what.chars().take(700).collect::<String>()
+        );
+    }
+    let by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut by: Vec<_> = by.into_iter().flatten().collect();
+    by.sort_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
+    // All of them together, and by their first word: the forty lines below
+    // are the heaviest only (100 of 226 ms waited in run 102), and what the
+    // commands do not account for is the layer's own lists (the card
+    // copies' passes, preludes) and the waits themselves.
+    if !by.is_empty() {
+        let mut kinds: Vec<(String, u64, u64)> = Vec::new();
+        for (what, (n, us, _)) in &by {
+            let word = what.split(' ').next().unwrap_or("").to_owned();
+            match kinds.iter_mut().find(|k| k.0 == word) {
+                Some(k) => (k.1, k.2) = (k.1 + n, k.2 + us),
+                None => kinds.push((word, *n, *us)),
+            }
+        }
+        kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
+        let all: u64 = kinds.iter().map(|k| k.2).sum();
+        let text: Vec<String> =
+            kinds.iter().map(|(word, n, us)| format!("{word} {:.1} ms in {:.0}", *us as f64 / 1e3 / frames, *n as f64 / frames)).collect();
+        tracing::info!(
+            "  the card's time by command (timing run), all {} kinds together: {:.1} ms a frame; by first word: {}",
+            by.len(),
+            all as f64 / 1e3 / frames,
+            text.join(", ")
+        );
+    }
+    for (what, (n, us, longest)) in by.into_iter().take(40) {
+        tracing::info!(
+            "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
+            us as f64 / 1e3 / frames,
+            n as f64 / frames,
+            longest as f64 / 1e3
+        );
+    }
+    tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize],
+    );
+    tracing::info!(
+        "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
+         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
+         such waits each); barrier experiment {}",
+        c[C::WaitsForGroups as usize],
+        c[C::WaitsForBuffers as usize],
+        c[C::IndirectBounded as usize],
+        barrier_test()
+    );
+    // What is compared after submissions, largest first, and how much of
+    // it shaders had written.
+    let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut compared: Vec<_> = compared.into_iter().flatten().collect();
+    compared.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
+    tracing::info!("  compared after submissions: {} ranges; the largest follow", compared.len());
+    for ((src, len), (n, written)) in compared.into_iter().take(8) {
+        tracing::info!(
+            "  compared {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame of it written back",
+            n as f64 / frames,
+            (len as u64 * n) as f64 / 1e6 / frames,
+            written as f64 / 1e6 / frames
+        );
+    }
+    let mut submitters = std::mem::take(&mut *SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()));
+    submitters.sort_by_key(|s| std::cmp::Reverse(s.1.submissions));
+    for (id, s) in submitters.into_iter().take(4) {
+        let per = |v: u64| v as f64 / 1e3 / frames;
+        tracing::info!(
+            "  thread {id} submitted {:.1}x/frame: between its submissions {:.1} ms (running \
+             {:.1} ms user + {:.1} ms kernel; {:.1} ms in list calls), in them running {:.1} ms \
+             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock",
+            s.submissions as f64 / frames,
+            per(s.between),
+            per(s.between_user),
+            per(s.between_kernel),
+            s.between_ours as f64 / 1e6 / frames,
+            per(s.inside_user),
+            per(s.inside_kernel),
+            per(s.lock),
+        );
+    }
+    let mut recorders = std::mem::take(&mut *RECORDERS.lock().unwrap_or_else(|e| e.into_inner()));
+    recorders.sort_by_key(|r| std::cmp::Reverse(r.1));
+    let busiest: Vec<String> = recorders
         .iter()
         .take(6)
         .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))

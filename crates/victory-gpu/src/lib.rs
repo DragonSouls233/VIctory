@@ -60,6 +60,8 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod tiles;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
