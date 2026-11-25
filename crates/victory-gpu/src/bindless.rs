@@ -278,6 +278,11 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     if !stopped {
         NEXT.store(0, Relaxed);
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        DEFERRED.fetch_add((len - served) as u64, Relaxed);
+        UPLOAD_BYTES.fetch_add(bytes, Relaxed);
+    }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
     recorded.then_some(Uploads(guard))
@@ -320,6 +325,12 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 #[cfg(feature = "diagnostics")]
 static UPLOADED: AtomicU64 = AtomicU64::new(0);
+/// Texture slots a submission's budget left due, and the bytes it copied
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+static DEFERRED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A draw or dispatch runs a shader that indexes the heap (and writes
 /// through it).
@@ -357,6 +368,9 @@ pub(crate) fn forget(resource: usize) {
 pub(crate) fn log(frames: f64) {
     let [draws, writes] = [0, 1].map(|i| HEAP_DRAWS[i].swap(0, Relaxed) as f64 / frames);
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
+    let deferred = DEFERRED.swap(0, Relaxed) as f64 / frames;
+    let upload_mb = UPLOAD_BYTES.swap(0, Relaxed) as f64 / frames / 1e6;
+    let landed = crate::texback::take_landed() as f64 / frames;
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,7 +399,9 @@ pub(crate) fn log(frames: f64) {
         let all_bytes: u64 = all.iter().map(|s| s.range().1).sum();
         tracing::info!(
             "heap views: {draws:.0} draws/frame index the heap ({writes:.0} writing through it), \
-             {uploaded:.0} textures uploaded/frame; slots: {buffers} buffer views ({} ranges, \
+             {uploaded:.0} textures uploaded/frame ({upload_mb:.1} MB, {deferred:.0} left due), \
+             {landed:.0} copied back to title memory/frame; \
+             slots: {buffers} buffer views ({} ranges, \
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
              left null: {}; host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
             inner.ranges.len(),

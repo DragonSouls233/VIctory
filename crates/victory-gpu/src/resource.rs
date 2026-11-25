@@ -1286,6 +1286,16 @@ pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
 }
 
+/// A title texture's size and format as it described them: what a kind of
+/// texture is told by (`crate::texback`).
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {

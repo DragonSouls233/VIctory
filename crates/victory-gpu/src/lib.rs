@@ -60,6 +60,7 @@ mod switch;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
+mod texback;
 mod texture;
 #[cfg(windows)]
 mod twin;
