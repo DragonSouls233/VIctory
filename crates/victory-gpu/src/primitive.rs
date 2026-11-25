@@ -6,10 +6,11 @@
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
-//! shaders linear in their inputs (blits, 2D quads). Inputs in formats
-//! [`components`] does not know keep the first vertex's value, and so do
-//! components past the end of the vertex (an element that reaches into the
-//! next one, which the layout allows).
+//! shaders linear in their inputs (blits, 2D quads). Unsupported formats
+//! keep the first vertex's value, and so do components past the end of the
+//! vertex (an element that reaches into the next one, which the layout allows).
+
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
@@ -48,19 +49,40 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
         fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
+            let inside = stride.saturating_sub(at);
+            if format == DXGI_FORMAT_R10G10B10A2_UNORM.0 as u32 {
+                if inside >= 4 {
+                    let field = at..at + 4;
+                    let colors = [0, 1, 2]
+                        .map(|i| u32::from_le_bytes(v(i)[field.clone()].try_into().unwrap()));
+                    fourth[field].copy_from_slice(&packed_unorm_corner(colors).to_le_bytes());
+                }
+                continue;
+            }
             let Some((n, kind)) = components(format) else {
                 continue;
             };
             // Only the components inside the vertex: the rest belong to the
             // next one.
-            let inside = stride.saturating_sub(at) / kind.bytes();
-            for c in 0..n.min(inside) {
+            for c in 0..n.min(inside / kind.bytes()) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
                 let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
             }
         }
     }
+}
+
+/// Reconstructs the fourth packed UNORM color one channel at a time.
+/// Each channel has the same scale at all corners, so work in integer units.
+fn packed_unorm_corner([first, middle, last]: [u32; 3]) -> u32 {
+    let mut corner = 0;
+    for (shift, mask) in [(0, 1023), (10, 1023), (20, 1023), (30, 3)] {
+        let channel = |value: u32| (value >> shift) & mask;
+        let value = (channel(first) + channel(last)).saturating_sub(channel(middle));
+        corner |= value.min(mask) << shift;
+    }
+    corner
 }
 
 #[derive(Clone, Copy)]
@@ -187,6 +209,30 @@ fn f32_to_half(v: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_packed_unorm_color_is_reconstructed_at_the_missing_corner() {
+        let pack = |r: u32, g: u32, b: u32, a: u32| r | g << 10 | b << 20 | a << 30;
+        let vertex = |color: u32| {
+            let mut bytes = [0; 8];
+            bytes[4..8].copy_from_slice(&color.to_le_bytes());
+            bytes
+        };
+        let src = [
+            vertex(pack(960, 220, 16, 1)),
+            vertex(pack(60, 150, 300, 0)),
+            vertex(pack(300, 200, 75, 3)),
+        ]
+        .concat();
+        let mut out = [0; 6 * 8];
+        let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM.0 as u32;
+        expand_rects(&src, &mut out, 8, &[(4, format)]);
+        assert_eq!(out[5 * 8 + 4..], pack(1023, 270, 0, 3).to_le_bytes());
+
+        // A packed element needs its entire word inside the vertex.
+        expand_rects(&src, &mut out, 8, &[(6, format)]);
+        assert_eq!(out[5 * 8..], src[..8]);
+    }
 
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the
