@@ -717,6 +717,31 @@ impl Host {
         })
     }
 
+    /// Whether the host supports the depth bounds test (from fxceless's
+    /// victory-fork); logged once. `VICTORY_DEPTH_BOUNDS=0` turns it off.
+    pub(crate) fn depth_bounds(&self) -> bool {
+        static BOUNDS: OnceLock<bool> = OnceLock::new();
+        *BOUNDS.get_or_init(|| {
+            if std::env::var_os("VICTORY_DEPTH_BOUNDS").is_some_and(|v| v == "0") {
+                return false;
+            }
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(supported, "host depth bounds support");
+            supported
+        })
+    }
+
     /// Whether the host runs 64-bit atomics on typed resources in the
     /// descriptor heap (translated 64-bit image atomics); logged once.
     pub(crate) fn heap_atomics64(&self) -> bool {

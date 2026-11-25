@@ -161,8 +161,19 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Waiting allowed per title frame, over all threads. From ztrx's
+/// `VICTORY_PIPELINE_WAIT_MS` (default 500 ms, `0` waits for nothing).
+fn wait_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(500);
+        tracing::info!(millis, "host pipeline wait budget per frame");
+        Duration::from_millis(millis)
+    })
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -219,12 +230,16 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    let budget = wait_budget();
+    if budget.is_zero() {
+        return;
+    }
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
