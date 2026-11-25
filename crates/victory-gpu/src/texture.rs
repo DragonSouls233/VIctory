@@ -746,7 +746,7 @@ impl Drop for Scratch {
 /// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
 /// final row of the final subresource, so `pitch * rows * depth` can exceed
 /// `total - offset`.
-fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+pub(crate) fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
     let padded = pitch
         .saturating_mul(rows as usize)
         .saturating_mul(depth as usize);

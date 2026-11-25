@@ -1296,10 +1296,15 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        // Textures of a kind the title reads back on its own CPU, written
+        // since the last submission (`crate::texback`): copied into a
+        // read-back buffer first, tiled into title memory after the run.
+        let back = crate::texback::prepare();
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
             .into_iter()
+            .chain(back.as_ref().map(|(list, _)| list))
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
@@ -1403,6 +1408,13 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        // Waited for above: the copies into the read-back buffers have run,
+        // so their texels can be tiled into the textures' title memory.
+        if let Some((_, backs)) = &back {
+            for b in backs {
+                crate::texback::land(b);
+            }
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
