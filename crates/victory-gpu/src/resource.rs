@@ -792,6 +792,11 @@ struct Resource {
     /// given up by [`evict`]); `Some(None)`: the host refused it.
     #[cfg(windows)]
     host: std::sync::Mutex<Option<Option<std::sync::Arc<HostTexture>>>>,
+    /// Whether a host texture was made for it: to look without its lock
+    /// (the eviction pass walks every resource of the title, and most of
+    /// them have no host texture).
+    #[cfg(windows)]
+    host_made: std::sync::atomic::AtomicBool,
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
@@ -1495,6 +1500,7 @@ impl Resource {
     #[cfg(windows)]
     fn host(&self) -> Option<std::sync::Arc<HostTexture>> {
         if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            self.host_made.store(made.is_some(), std::sync::atomic::Ordering::Relaxed);
             return made;
         }
         // Made without the lock held (`shared_texture` takes the memory
@@ -1503,7 +1509,9 @@ impl Resource {
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
         let made = shared_texture(self.data() as u64, &self.desc, state, clear);
         // A texture made meanwhile by another thread is the memory's too.
-        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
+        let made = self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone();
+        self.host_made.store(made.is_some(), std::sync::atomic::Ordering::Relaxed);
+        made
     }
 
     fn data(&self) -> *mut u8 {
@@ -1690,9 +1698,15 @@ pub(crate) fn evict_among(
 /// title textures holding it.
 #[cfg(windows)]
 fn candidates() -> Vec<Owned> {
+    use std::sync::atomic::Ordering::Relaxed;
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let mut by: std::collections::HashMap<usize, Owned> = std::collections::HashMap::new();
     for &r in at.values().flatten() {
+        // Most of the title's resources have no host texture: the flag says
+        // so without its lock (the pass walks every resource, a frame).
+        if !resource(r as This).host_made.load(Relaxed) {
+            continue;
+        }
         if let Some(t) = made(resource(r as This)).filter(|t| evictable(t)) {
             by.entry(std::sync::Arc::as_ptr(&t) as usize).or_insert_with(|| (t, Vec::new())).1.push(r);
         }
@@ -1752,6 +1766,7 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
                 *h = None;
+                resource(r as This).host_made.store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if let Some(k) = t.key {
@@ -1800,6 +1815,8 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: std::sync::Mutex::new(None),
+        #[cfg(windows)]
+        host_made: std::sync::atomic::AtomicBool::new(false),
         // The clear value names the format too: format, then color or
         // depth and stencil (5 words), kept for when the texture is made.
         #[cfg(windows)]
