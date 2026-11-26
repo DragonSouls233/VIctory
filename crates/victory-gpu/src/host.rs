@@ -2269,9 +2269,16 @@ impl HostList {
     }
 
     /// Shaders of the list read title memory through the page table of
-    /// view heap `heap` (`crate::memory::prepare` at submission).
+    /// view heap `heap` (`crate::memory::prepare` at submission): once until
+    /// a step writes title memory, as a buffer range or a heap's views are
+    /// (a draw after such a step needs the copies brought up to date again).
+    /// Marvisak PR #2240 (denkencar-sketch).
     pub(crate) fn defer_memory(&self, heap: usize) {
-        self.deferred().copies.push(Step::Memory(heap));
+        let mut deferred = self.deferred();
+        // Not a buffer range (an address) or a heap's views (`usize::MAX`, 0).
+        if deferred.refreshed.insert((heap, usize::MAX, 1)) {
+            deferred.copies.push(Step::Memory(heap));
+        }
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -4147,7 +4154,7 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, HostList, Step};
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again
@@ -4183,6 +4190,34 @@ mod batch {   // `mod tests` is already taken at the top of this file
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// A list reading title memory through a view heap's page table brings
+    /// the copies up to date once, and again after a step that writes title
+    /// memory (as a buffer range or a heap's views are), not only at its
+    /// first draw. Marvisak PR #2240.
+    #[test]
+    fn title_memory_is_refreshed_again_after_a_title_write() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let memory_steps = |list: &HostList| {
+            list.deferred()
+                .copies
+                .iter()
+                .filter(|s| matches!(s, Step::Memory(_)))
+                .count()
+        };
+        list.defer_memory(7);
+        list.defer_memory(7);
+        assert_eq!(memory_steps(&list), 1, "once until a title write");
+        list.defer_copy(std::ptr::null_mut(), std::ptr::null(), 0);
+        list.defer_memory(7);
+        list.defer_memory(7);
+        assert_eq!(memory_steps(&list), 2, "again after it, once");
+        list.defer_memory(8);
+        assert_eq!(memory_steps(&list), 3, "a heap of its own");
     }
 }
 

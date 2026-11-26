@@ -479,21 +479,23 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
-    /// written before it is read.
+    /// this file's encoding, the loop limit, the clean-up passes) makes
+    /// another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 31);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 31));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 31));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 31));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 31));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 15));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::shader_opt()
             )
         );
         // The encoding part is this file as built.

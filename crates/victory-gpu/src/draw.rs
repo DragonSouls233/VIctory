@@ -526,6 +526,10 @@ impl State {
         if let Some((h, map)) = &self.memory
             && *h == heap
         {
+            // Asked again: after a step that wrote title memory the copies
+            // are brought up to date again (a no-op otherwise). Marvisak PR
+            // #2240.
+            list.defer_memory(heap);
             return Some((map.table, map.dirty));
         }
         let map = crate::memory::bind(list, heap)?;
