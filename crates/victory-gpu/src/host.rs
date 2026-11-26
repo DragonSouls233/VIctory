@@ -748,6 +748,18 @@ pub(crate) mod tests {
         eprintln!("PresentX compositor initialized");
     }
 
+    /// An empty submission runs nothing and does not wait on the fence.
+    /// Marvisak PR #1424 (BaggyALPHA).
+    #[test]
+    fn an_empty_submission_leaves_the_host_fence_untouched() {
+        let Ok(host) = create() else { return };
+        host.execute(&[]);
+        let submitted = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live fence, queried only.
+        let completed = unsafe { host.fence.GetCompletedValue() };
+        assert_eq!((submitted, completed), (0, 0));
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -1250,6 +1262,9 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
