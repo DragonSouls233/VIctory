@@ -989,27 +989,136 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Counts the changes to the tables [`find`] reads that can change what an
+/// ask finds: a buffer registered or released, a copy made in a table or a
+/// window made. Kept apart from [`GENERATION`], which names copies for
+/// diagnostics. A thread's remembered answers ([`FOUND`]) are from one count.
+static TABLES_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+fn tables_generation() -> u64 {
+    TABLES_CHANGED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Asks answered from a thread's own memory of them, and asks that went to
+/// the tables.
+pub(crate) static LOOKUPS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a thread remembers what its asks found (`VICTORY_LOOKUP_CACHE=1`;
+/// `alt`: twenty seconds with, twenty without).
+///
+/// Every bind of a draw asks for the host copy of each buffer it reads,
+/// under the buffer table's one lock: about 245,000 asks a frame in the
+/// title's recording threads. A thread keeps what each ask found, weakly
+/// (an unused copy can still be let go), while the tables have not changed.
+/// Off by default here until a run has carried it.
+fn lookup_cache() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_CACHE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a thread remembers what its asks for a buffer's host copy found from now (VICTORY_LOOKUP_CACHE=alt): {}",
+                    if on { "ON" } else { "off, every ask goes to the tables as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most asks a thread remembers before it starts again.
+const FOUND_MOST: usize = 8192;
+type Found = std::collections::HashMap<(u64, u64), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    /// What this thread's asks found, and the count of table changes they
+    /// are from.
+    static FOUND: std::cell::RefCell<(u64, Found)> =
+        std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
+/// The copy of the innermost title buffer holding `[address, address +
+/// len)`, made on first use.
+pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !lookup_cache() {
+        return find_tables(address, len);
+    }
+    let changes = tables_generation();
+    let found = FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len)).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = found {
+        // A change between the count and the use of the remembered answer
+        // makes it stale: go to the tables instead.
+        if tables_generation() == changes {
+            LOOKUPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(shadow);
+        }
+    }
+    LOOKUPS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let shadow = find_tables(address, len)?;
+    FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        // Remember it under the count the tables were read with: a change
+        // since then clears it at the next ask.
+        if f.0 == changes {
+            if f.1.len() >= FOUND_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len), std::sync::Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // After the insert, under the table's lock: a thread that asked
+    // between the two would otherwise keep the old answer under the new
+    // count for good.
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    let mut map = buffers();
+    // Before the removal, under the table's lock.
+    tables_changed();
+    if map.remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
 }
 
-/// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
-pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+/// The tables themselves, without a thread's memory of past asks.
+fn find_tables(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -1045,6 +1154,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
             );
         }
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        tables_changed();
         changed();
     }
     entry.shadow.clone()
@@ -1078,6 +1188,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     changed();
     Some(shadow)
 }
@@ -1305,6 +1416,43 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A registration is counted after the entry is in, under the table's
+    /// lock: a thread that asked between the two must not keep the old
+    /// table's answer under the new count for good.
+    #[test]
+    fn a_pending_registration_invalidates_readers_of_the_old_table() {
+        use std::sync::atomic::Ordering;
+        // No card needed: the address of a stack slot is the key.
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let table = buffers();
+        let initial = TABLES_CHANGED.load(Ordering::Acquire);
+        let ready = std::sync::Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready.wait();
+                register(resource, start, 8);
+            });
+            ready.wait();
+            // A writer that counted before taking the lock would show it
+            // in this time; a right one stays blocked all the while.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            while TABLES_CHANGED.load(Ordering::Acquire) == initial
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let count = TABLES_CHANGED.load(Ordering::Acquire);
+            assert!(!table.contains_key(&(start, resource)));
+            drop(table);
+            count
+        });
+        let committed = TABLES_CHANGED.load(Ordering::Acquire);
+        unregister(resource, start);
+        assert_ne!(committed, observed, "the old table still has the current count");
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.

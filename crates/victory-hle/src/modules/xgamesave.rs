@@ -213,7 +213,12 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // An unfinished version is never read. If something holds a
+            // file in it, leave it for a later look instead of failing
+            // every save of this container.
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -231,7 +236,14 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
             continue;
         };
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let old = dir.join(format!("v{old}"));
+            // A scanner or a backup holding one of its files without
+            // delete sharing must not make the whole container unreadable:
+            // the newest version is the container whatever is left below
+            // it, and what is left goes at a later save.
+            if let Err(e) = std::fs::remove_dir_all(&old) {
+                tracing::info!(dir = %old.display(), %e, "an older save version stays for now; it goes at a later save");
+            }
         }
         return Ok(Some(Version {
             dir: version,
@@ -1038,6 +1050,51 @@ mod tests {
         let blobs = read(&c, None).unwrap();
         let text = |(n, d): (String, Vec<u8>)| (n, String::from_utf8(d).unwrap());
         Some((display, blobs.into_iter().map(text).collect()))
+    }
+
+    /// A file of an older version held by another program (a virus scanner,
+    /// a backup in progress) keeps that version from being removed. The
+    /// saves after it must not fail: the newest version is the container
+    /// whatever is left below it, and what is left goes at a later save.
+    #[test]
+    fn an_older_version_that_cannot_be_removed_does_not_fail_the_saves_after_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let versions = || {
+            let entries = std::fs::read_dir(&dir).unwrap().flatten();
+            entries
+                .filter(|e| e.file_name().to_string_lossy().starts_with('v'))
+                .count()
+        };
+        assert_eq!(update(root.path(), "one", &[("a", Some("first a"))]), S_OK);
+        let first = current(&dir).unwrap().unwrap();
+        // Opened with no sharing: nobody else can delete it while it is held.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(first.blob(0))
+            .unwrap();
+        // Blob `a` is written anew each time, so no version shares the file.
+        assert_eq!(update(root.path(), "two", &[("a", Some("second a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("two".into(), vec![("a".into(), "second a".into())]))
+        );
+        assert_eq!(update(root.path(), "three", &[("a", Some("third a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("three".into(), vec![("a".into(), "third a".into())]))
+        );
+        assert!(first.blob(0).exists(), "the held file is still there");
+        // Let go of it: the next look removes what was left.
+        drop(held);
+        assert_eq!(update(root.path(), "four", &[("a", Some("fourth a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("four".into(), vec![("a".into(), "fourth a".into())]))
+        );
+        assert_eq!(versions(), 1);
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {

@@ -181,8 +181,20 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title's per-draw
         // table slots; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // On a host that caps view heaps, the title rewrites about 100,000
+        // records a frame in slots we have no counterpart for (its own
+        // per-draw tables): about half of the heap's changed pages. Those
+        // pages were asked about and read every frame although none of
+        // their records is ever mirrored. Look only at the part we mirror.
+        // `VICTORY_HEAP_SYNC_CUT=0` walks the whole heap again.
+        let cut = std::env::var_os("VICTORY_HEAP_SYNC_CUT").is_none_or(|v| v != "0");
+        let looked_end = if cut {
+            (start as usize).saturating_add(mirrored_count as usize * step as usize)
+        } else {
+            usize::MAX
+        };
         let mut page_bytes: Vec<u8> = Vec::new();
-        for (from, to) in written.take(start as usize, usize::MAX) {
+        for (from, to) in written.take(start as usize, looked_end) {
             // By page: read the whole changed range through the kernel into
             // a copy. A page the title unmaps in between then fails the read
             // instead of faulting on the thousands of in-place record reads.
