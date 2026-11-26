@@ -581,14 +581,27 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The clean-up passes over the module (`bitcode::opt`) before the
+        // flags are decided below: a feature whose last use a pass removed
+        // must not be declared (the validator compares the flags with what
+        // the code uses). From Belobug's `ae75a66`.
+        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if passes != 0 {
+            self.m.optimise(passes);
+        }
         // The flags of what lowering made, as the module writes it: what only
         // unread values or never-taken edges used is not written.
         let uses = self.m.uses();
+        // The flags the clean-up can leave without a last use: a typed UAV
+        // load or a 64-bit atomic it removed must not be declared.
+        let cleaned = self.m.usage();
         for (flag, used) in [
             (flags::RESOURCE_HEAP, uses.heap),
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (flags::TYPED_UAV_LOADS, cleaned.typed_uav_loads),
+            (flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP, cleaned.atomic64),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }

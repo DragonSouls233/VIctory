@@ -267,10 +267,36 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// The clean-up passes over a translated program before it is written
+/// (`bitcode::opt`): a set of that module's pass bits. Every pass is exact,
+/// so the switch tells a translator fault from a clean-up fault and measures
+/// what the clean-up is worth. `VICTORY_SHADER_OPT`:
+/// - unset: every pass;
+/// - `0`: none (the module as the lowering made it);
+/// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
+///   and identities, 4 one instruction for one value, 8 what a branch taken
+///   says about its condition, 16 one read for one place within a block.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s does).
+/// From Belobug's `ae75a66` (the `ba8697aa` fork's `emit/bitcode/opt.rs`).
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or unreadable.
+/// Pure, for testing.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value.map(str::trim).and_then(|v| match v.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    });
+    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
-fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
+fn parse_loop_limit(value: Option<&str>) -> u32 {    let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
@@ -1742,10 +1768,13 @@ mod tests {
             eprintln!("no dxc.exe; DXIL check skipped");
             return;
         };
-        // The low-half write keeps the destination's high half.
-        assert!(low.contains("-65536"), "low write keeps the high half");
+        // The low-half write keeps the destination's high half and does not
+        // shift its result up. The high half here is the constant 0, so the
+        // clean-up folds the masking away (`and 0, -65536`): the check is on
+        // the shift, which no pass removes.
+        assert!(!low.contains("shl i32 %"), "low write keeps the high half");
         // The high-half write shifts the result up by 16.
-        assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
+        assert!(high.contains("shl i32 %"), "op_sel[3] writes the high half");
         // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.
         assert!(high.contains("2.000000e+00"), "omod multiplies by two");
         assert!(
