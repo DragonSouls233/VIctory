@@ -64,6 +64,9 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The formats of the views bound on the host list: a draw's pipeline
+    /// is one for them (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// Whether a render target or the depth the title set has no host view:
     /// a draw then is not recorded (`OMSetRenderTargets` would name fewer
     /// views than the pipeline's `NumRenderTargets`, which the device
@@ -294,6 +297,17 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live resource.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -467,6 +481,7 @@ impl State {
         };
         self.targets.clear();
         self.targets_bad = false;
+        let mut formats = [0u32; 9];
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -488,7 +503,11 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            let desc = record.desc();
+            if rtvs.len() < 8 {
+                formats[rtvs.len()] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
+            }
+            rtvs.push(host.rtv(&texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -496,8 +515,11 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            let desc = record.depth_desc();
+            formats[8] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
+            Some(host.dsv(&texture, desc.as_ref()))
         });
+        self.target_formats = formats;
         if dsv.is_none() && depth != 0 {
             once!(
                 handle = format_args!("{depth:#x}"),
@@ -621,7 +643,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {

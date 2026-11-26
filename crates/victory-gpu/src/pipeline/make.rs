@@ -24,7 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -42,6 +42,12 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// The formats its state declares for what a draw draws into (zeros
+    /// without a graphics state).
+    pub(crate) formats: TargetFormats,
+    /// The same shaders and state for other formats bound at a draw: a
+    /// chain from the title's pipeline, one link per set of formats met.
+    variant: OnceLock<Arc<Pending>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -65,6 +71,7 @@ impl Pending {
         #[cfg(feature = "diagnostics")]
         let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
         let made = OnceLock::new();
+        let formats = graphics.as_ref().map_or([0; 9], |g| g.formats());
         // Publish the completed result before the pipeline can be queued.
         #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
@@ -81,6 +88,8 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
+            formats,
+            variant: OnceLock::new(),
         }
     }
 
@@ -214,6 +223,64 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares
+/// gets a host pipeline for those formats. On by default;
+/// `VICTORY_TARGET_VARIANTS=0` sends such a draw out with the title's
+/// pipeline, as before.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+}
+
+/// The host pipeline for a draw with `p` into views of `bound`, which `p`
+/// does not declare: that of the same shaders and state for those formats.
+/// It is a pipeline like the title's own: queued at its first draw, made by
+/// a worker, and waited for within the frame's budget ([`ready`]).
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => {
+            ready(variant(p, g, &super::host::formats_for(&p.formats, bound)))
+        }
+        _ => ready(p),
+    }
+}
+
+/// The pipeline of `p`'s shaders and its state `g` for `bound`: found in
+/// the chain that starts at `p`, or added to it (once per set of formats).
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    // A state made for `bound` declares exactly it, so the walk ends at
+    // that link; the count bounds it all the same.
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (eight render targets, then depth; VICTORY_TARGET_VARIANTS=0: the draw goes out with the title's pipeline)"
+            );
+            #[cfg(feature = "diagnostics")]
+            let skipped: Vec<String> = p.skipped_shader.clone().into_iter().collect();
+            Arc::new(Pending::new(
+                p.shaders.clone(),
+                Some(Box::new(g.with_formats(bound))),
+                #[cfg(feature = "diagnostics")]
+                &skipped,
+            ))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early
@@ -446,5 +513,47 @@ mod tests {
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
+    }
+
+    /// A state that declares one render target, of format `format` (tests).
+    #[cfg(test)]
+    pub(crate) fn declaring(format: i32) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format);
+        g
+    }
+
+    /// A draw into other formats than its pipeline declares finds the
+    /// pipeline for them, which is made once per set of formats.
+    #[test]
+    fn a_pipeline_for_bound_formats_is_made_once() {
+        let p = Arc::new(Pending::new(vec![], Some(Box::new(declaring(24)))));
+        assert_eq!(p.formats, [24, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let g = p.graphics.as_deref().unwrap();
+        let (a, b) = ([26, 0, 0, 0, 0, 0, 0, 0, 0], [28, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(super::super::host::formats_differ(&p.formats, &a));
+        let first = variant(&p, g, &super::super::host::formats_for(&p.formats, &a));
+        assert_eq!(first.formats, a);
+        assert_ne!(first.key, p.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &super::super::host::formats_for(&p.formats, &a))));
+        let second = variant(&p, g, &super::super::host::formats_for(&p.formats, &b));
+        assert_eq!(second.formats, b);
+        assert!(!Arc::ptr_eq(first, second));
+        assert_ne!(second.key, first.key);
+    }
+
+    /// Only a render target slot the pipeline declares counts: an empty
+    /// slot, one the pipeline declares nothing for, and depth are left
+    /// alone (the debug layer named no depth mismatch in 3,100 frames).
+    #[test]
+    fn only_a_declared_target_with_another_format_differs() {
+        use super::super::host::{formats_differ, formats_for};
+        let declared = [24, 28, 0, 0, 0, 0, 0, 0, 10];
+        assert!(formats_differ(&declared, &[26, 28, 0, 0, 0, 0, 0, 0, 10]));
+        assert!(!formats_differ(&declared, &[24, 0, 0, 0, 0, 0, 0, 0, 10]));
+        assert!(!formats_differ(&declared, &[24, 28, 40, 0, 0, 0, 0, 0, 10]));
+        assert!(!formats_differ(&declared, &[24, 28, 0, 0, 0, 0, 0, 0, 90]));
+        assert_eq!(formats_for(&declared, &[26, 0, 0, 0, 0, 0, 0, 0, 10]), [26, 28, 0, 0, 0, 0, 0, 0, 10]);
     }
 }
