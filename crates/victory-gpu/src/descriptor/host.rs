@@ -14,6 +14,21 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+/// The locks [`HostHeap::kept`] is spread over: slot `i` is behind lock
+/// `i % KEPT_PIECES`, at place `i / KEPT_PIECES`. Neighbouring slots sit
+/// behind different locks on purpose: recording threads take their tables'
+/// dynamic slots from one ring, next to one another.
+const KEPT_PIECES: u32 = 64;
+
+/// Whether the recording threads are spared the heap's two busiest locks.
+/// On by default: a slot already made from the record its draw names is
+/// found in an atomic without the slots' lock, and the resources slots
+/// hold are behind 64 locks instead of one, with the old resource let go
+/// outside the lock. `VICTORY_HEAP_LOCKS=0` restores both locks.
+fn heap_locks() -> bool {
+    std::env::var_os("VICTORY_HEAP_LOCKS").is_none_or(|v| v != "0")
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -26,12 +41,19 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The same, readable without the lock: 0 while a slot is being made
+    /// again, set to its record only once the slot is made and kept.
+    made_now: Vec<AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
-    kept: Mutex<Vec<Kept>>,
+    /// In [`KEPT_PIECES`] pieces, each behind its own lock.
+    kept: Vec<Mutex<Vec<Kept>>>,
+    /// Without [`heap_locks`]: the one line every `keep` stands in, as
+    /// when `kept` was behind one lock.
+    kept_one: Mutex<()>,
     /// Where the search for free dynamic slots starts, which are taken (by
     /// lists not yet reset), and the smallest run known not to be free
     /// since the last release (`usize::MAX`: none).
@@ -225,7 +247,11 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            made_now: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            kept: (0..KEPT_PIECES)
+                .map(|_| Mutex::new(vec![None; (count + extra).div_ceil(KEPT_PIECES) as usize]))
+                .collect(),
+            kept_one: Mutex::new(()),
             next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
@@ -534,6 +560,9 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
+        if let Some(now) = self.made_now.get(index as usize) {
+            now.store(0, Ordering::Release);
+        }
         self.set_stride(index, None);
         self.set_mark(index, None);
         self.note_address(index, None);
@@ -587,10 +616,21 @@ impl HostHeap {
         self.marks.as_ref().map(|(buffer, _)| buffer)
     }
 
+    /// The lock that owns slot `index` in [`Self::kept`].
+    fn kept_piece(&self, index: u32) -> std::sync::MutexGuard<'_, Vec<Kept>> {
+        self.kept[(index % KEPT_PIECES) as usize].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
+        let piece = &self.kept[(index % KEPT_PIECES) as usize];
+        let at = (index / KEPT_PIECES) as usize;
+        let locks = heap_locks();
+        // Without the switch: the one line every `keep` stands in.
+        let _one = (!locks).then(|| self.kept_one.lock().unwrap_or_else(|e| e.into_inner()));
+        let old = {
+            let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(slot) = kept.get_mut(at) else { return };
             let old = std::mem::replace(slot, resource);
             #[cfg(feature = "diagnostics")]
             if let Some((old, _)) = &old
@@ -603,13 +643,15 @@ impl HostHeap {
                 let left = crate::resource::life::holders(old);
                 crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
             }
-            // Title threads rewrite slots while the GPU runs a submission;
-            // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
-            }
+            old
+        };
+        drop(_one);
+        // Title threads rewrite slots while the GPU runs a submission;
+        // one of its shaders may hold the old descriptor (or read the slot
+        // at an index from wrong data): what it views is freed only once
+        // that work has run. Outside the lock: retiring takes another one.
+        if let Some((old, _)) = old {
+            crate::host::retire(old);
         }
     }
 
@@ -850,6 +892,18 @@ impl HostHeap {
         };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // A slot already made from this very record is served without the
+        // made lock: the answer the lock would give (nothing is done under
+        // it for such a slot either). Only on the heap-sync path: a draw
+        // may have to make a placed texture's view again.
+        if !for_draw
+            && heap_locks()
+            && tag == VIEW_TAG
+            && self.made_now[index as usize].load(Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -857,6 +911,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.made_now[index as usize].store(0, Ordering::Release);
                 self.make_null(index);
                 self.note_address(index, None);
             }
@@ -870,7 +925,7 @@ impl HostHeap {
             if !for_draw || !is_texture(&view) {
                 return false;
             }
-            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
+            let held = self.kept_piece(index)[(index / KEPT_PIECES) as usize]
                 .as_ref()
                 .map(|(res, _)| windows::core::Interface::as_raw(res));
             let Some(held) = held else {
@@ -919,6 +974,8 @@ impl HostHeap {
                 return Some(view);
             }
         }
+        // Being made again: not "made" to a lock-free reader until kept.
+        self.made_now[index as usize].store(0, Ordering::Release);
         {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
@@ -940,6 +997,9 @@ impl HostHeap {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
+            // Only once the slot is made and kept is its record served
+            // without the lock.
+            self.made_now[index as usize].store(made[index as usize], Ordering::Release);
         }
         Some(view)
     }
@@ -952,7 +1012,7 @@ impl HostHeap {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        let kept = self.kept_piece(index).get((index / KEPT_PIECES) as usize).is_some_and(Option::is_some);
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
@@ -978,14 +1038,23 @@ impl HostHeap {
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
         let slots: Vec<u32> = {
-            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            (0..kept.len() as u32)
-                .filter(|&i| {
-                    kept[i as usize]
-                        .as_ref()
-                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
-                })
-                .collect()
+            let mut slots = Vec::new();
+            for (piece, kept) in self.kept.iter().enumerate() {
+                let kept = kept.lock().unwrap_or_else(|e| e.into_inner());
+                for (at, k) in kept.iter().enumerate() {
+                    let index = piece as u32 * KEPT_PIECES + at as u32;
+                    if index >= self.count + self.dynamic {
+                        continue;
+                    }
+                    if k.as_ref().is_some_and(|k| {
+                        k.1.is_none()
+                            && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+                    }) {
+                        slots.push(index);
+                    }
+                }
+            }
+            slots
         };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
@@ -996,6 +1065,9 @@ impl HostHeap {
                 None => null_view(self.cpu(index)),
             }
             self.keep(index, None);
+            if let Some(now) = self.made_now.get(index as usize) {
+                now.store(0, Ordering::Release);
+            }
             if index < self.count {
                 self.viewed.set(index, view.as_ref(), false);
                 crate::shadow::forget_read(index);
@@ -1005,11 +1077,15 @@ impl HostHeap {
 
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .iter()
-            .filter_map(|&i| kept.get(i as usize)?.as_ref().filter(|k| k.1.is_none()))
-            .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
+            .filter_map(|&i| {
+                self.kept_piece(i)
+                    .get((i / KEPT_PIECES) as usize)?
+                    .as_ref()
+                    .filter(|k| k.1.is_none())
+                    .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
+            })
             .collect()
     }
 
@@ -1018,7 +1094,7 @@ impl HostHeap {
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        let kept = self.kept_piece(index).get((index / KEPT_PIECES) as usize).is_some_and(Option::is_some);
         (is_placed_texture(&view) && !kept).then_some(view)
     }
 
@@ -1046,7 +1122,7 @@ impl HostHeap {
     /// Whether slot `index` holds a host view of a resource (tests).
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
-        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+        self.kept_piece(index)[(index / KEPT_PIECES) as usize].is_some()
     }
 }
 
@@ -2631,16 +2707,19 @@ mod tests {
             ));
             assert!(heap.mirror(idx as u32, slot_addr, false).is_some());
             assert!(
-                heap.kept.lock().unwrap()[idx].is_none(),
+                heap.kept_piece(idx as u32)[(idx / KEPT_PIECES as usize)].is_none(),
                 "case {idx} mirror(false) should defer host creation"
             );
             let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap();
             let dyn_slot = heap.count + idx as u32;
             heap.make_at(dyn_slot, &mirrored);
-            let kept = heap.kept.lock().unwrap();
-            assert_eq!(kept[idx].is_some(), expect_real, "case {idx} mirror");
             assert_eq!(
-                kept[dyn_slot as usize].is_some(),
+                heap.kept_piece(idx as u32)[(idx / KEPT_PIECES as usize)].is_some(),
+                expect_real,
+                "case {idx} mirror"
+            );
+            assert_eq!(
+                heap.kept_piece(dyn_slot)[(dyn_slot / KEPT_PIECES) as usize].is_some(),
                 expect_real,
                 "case {idx} make_at"
             );
@@ -2662,7 +2741,7 @@ mod tests {
             crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, slot_addr);
             heap.mirror(idx as u32, slot_addr, true).unwrap();
             assert_eq!(
-                heap.kept.lock().unwrap()[idx].is_some(),
+                heap.kept_piece(idx as u32)[(idx / KEPT_PIECES as usize)].is_some(),
                 expect_real,
                 "srv case {offset}"
             );

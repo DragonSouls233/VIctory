@@ -239,6 +239,53 @@ macro_rules! once {
     }};
 }
 
+/// Whether the stages of one draw share a table they both need made afresh.
+/// On by default: a mesh stage and a pixel stage reading one root table to
+/// different depths made it twice, in dynamic slots of their own, because
+/// the slot count is part of [`State::fresh_tables`]' key. All stages now
+/// ask for the larger count and the second finds the first one's table
+/// (about 24% fewer slots in a heavy frame). `VICTORY_TABLE_STAGES=0`
+/// restores the old behaviour.
+fn table_stages() -> bool {
+    std::env::var_os("VICTORY_TABLE_STAGES").is_none_or(|v| v != "0")
+}
+
+/// Per root table the stages of `p` read: (root parameter, slots up to the
+/// last entry read by a stage that also reads a constant view there, slots
+/// up to the last entry any stage reads). Zero with the switch off.
+fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
+    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
+    for stage in &p.stages {
+        let t = stage.translated();
+        let mut constant = [false; 256];
+        for u in t
+            .used
+            .iter()
+            .filter(|u| u.root == RootType::Table && u.kind == ResourceType::Cbv)
+        {
+            if let Some(at) = constant.get_mut(usize::from(u.slot)) {
+                *at = true;
+            }
+        }
+        for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+            let n = u.table_offset_dwords / 8 + 1;
+            let with = if constant.get(usize::from(u.slot)).copied().unwrap_or(false) {
+                n
+            } else {
+                0
+            };
+            match spans.iter_mut().find(|s| s.0 == u.slot) {
+                Some(s) => {
+                    s.1 = s.1.max(with);
+                    s.2 = s.2.max(n);
+                }
+                None => spans.push((u.slot, with, n)),
+            }
+        }
+    }
+    spans
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -750,6 +797,9 @@ impl State {
             }
             crate::bindless::note_draw(writes);
         }
+        // All stages of a draw ask for the same depth of a shared table, so
+        // a table one stage made is found by the next ([`table_stages`]).
+        let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
@@ -760,7 +810,7 @@ impl State {
                     .host()
                     .and_then(|h| h.view_addresses());
             }
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, compute, &spans);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1342,7 +1392,13 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+        spans: &[(u8, u32, u32)],
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
@@ -1389,11 +1445,23 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
+            let mut n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            // [`table_stages`]: use the depth the furthest-reading stage
+            // needs, so all stages of the draw find the same table. For a
+            // table that lies inside the host's title slots, only stages
+            // reading a constant view need one made afresh (the title's
+            // slots hold no constant view); one past the host's slots is
+            // made afresh for every stage that reads it.
+            if let Some(&(_, with_constants, all)) = spans.iter().find(|s| s.0 == slot) {
+                let past = heap
+                    .index(table)
+                    .is_some_and(|at| u64::from(at) + u64::from(all) > u64::from(host.count()));
+                n = n.max(if past { all } else { with_constants });
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
