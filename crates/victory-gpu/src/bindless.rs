@@ -320,6 +320,8 @@ pub(crate) fn uploads(
             NEXT.store(0, Relaxed);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    let served_count = served.len();
     let work: Vec<_> = served.into_iter().map(|k| work[k].clone()).collect();
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
@@ -338,7 +340,7 @@ pub(crate) fn uploads(
     }
     #[cfg(feature = "diagnostics")]
     {
-        DEFERRED.fetch_add((len - served) as u64, Relaxed);
+        DEFERRED.fetch_add((len - served_count) as u64, Relaxed);
         UPLOAD_BYTES.fetch_add(bytes, Relaxed);
     }
     list.close();
@@ -377,9 +379,14 @@ impl Uploads {
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, _, bit) in inner.hulls.values() {
+    for (shadow, address, len, uav, bit) in inner.hulls.values() {
         if !crate::watch::clean_bit(*bit) {
-            add(shadow, *address as usize, *len as usize);
+            let (address, len) = if *uav && shadow.marked() {
+                shadow.page_range(*address, *len)
+            } else {
+                (*address, *len)
+            };
+            add(shadow, address as usize, len as usize);
         }
     }
 }
