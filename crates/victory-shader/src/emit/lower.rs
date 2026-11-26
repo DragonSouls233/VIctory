@@ -6340,6 +6340,31 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
+            "v_dot8_i32_i4" => {
+                // VOP3P: eight sign-extended nibble products against the
+                // accumulator (RDNA2 ISA). DXIL has no intrinsic for it, so
+                // each nibble is moved to the top of the word and shifted
+                // back arithmetically. The products sum to within
+                // [-448, 512], so only the accumulator's add can overflow.
+                // (From VItoriaBr's #44.)
+                if v.clamp || v.neg_hi != 0 || v.opsel != 0 || v.opsel_hi != 0 {
+                    return Err("a saturating, negated or half-selected dot product");
+                }
+                let (s0, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let k28 = self.s.m.i32(28);
+                let mut dot = self.s.m.i32(0);
+                for i in 0..8u32 {
+                    let up = self.s.m.i32(28 - i * 4);
+                    let a = self.s.m.bin(c, Bin::Shl, s0, up);
+                    let a = self.s.m.bin(c, Bin::AShr, a, k28);
+                    let b = self.s.m.bin(c, Bin::Shl, s1, up);
+                    let b = self.s.m.bin(c, Bin::AShr, b, k28);
+                    let product = self.s.m.bin(c, Bin::Mul, a, b);
+                    dot = self.s.m.bin(c, Bin::Add, dot, product);
+                }
+                let r = self.s.m.bin(c, Bin::Add, dot, s2);
+                int(self, r)
+            }
             "v_mov_b32" => {
                 if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;
@@ -11240,6 +11265,27 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    /// `v_dot8_i32_i4 v0, v1, v2, v3` decodes, and translates in a program
+    /// that stores its result, so it is not dropped as dead. The saturating
+    /// and half-selected forms are refused rather than miscompiled. (From
+    /// VItoriaBr's #44.)
+    #[test]
+    fn signed_nibble_dot_product_translates() {
+        let dot = |clamp: u32| [0xCC18_0000 | clamp << 15, 0x101 | 0x102 << 9 | 0x103 << 18];
+        let mut alone = dot(0).to_vec();
+        alone.push(S_ENDPGM);
+        let code: Vec<u8> = alone.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let names: Vec<_> = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.name())
+            .collect();
+        assert!(names.contains(&Some("v_dot8_i32_i4")), "{names:?}");
+        lower_valu(&dot(0)).expect("the signed nibble dot product translates");
+        // The saturating form is refused, not silently read as its add.
+        assert!(lower_valu(&dot(1)).is_err());
     }
 
     /// Lowers a one-thread compute program that copies four root constants
