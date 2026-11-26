@@ -602,7 +602,7 @@ pub(crate) mod tests {
             })
             .collect();
         let owned: Vec<_> = textures.iter().map(|&t| crate::resource::owned(t).expect("may be given up")).collect();
-        let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
+        let idle = (crate::resource::IDLE_MS, crate::resource::IDLE_FRAMES);
         {
             // No submission takes the marks meanwhile.
             let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -613,7 +613,7 @@ pub(crate) mod tests {
                     crate::shadow::tests::mark_read(false, 6);
                 }
                 let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-                crate::resource::evict_among(&owned, &read, 1000 + k * idle_frames / 3, 1_000_000 + k * idle_ms / 3, 0);
+                crate::resource::evict_among(&owned, &read, 1000 + k * idle.1 / 3, 1_000_000 + k * idle.0 / 3, 0, idle);
                 assert!(crate::resource::made_copy(textures[0]).is_some(), "read every frame: stays (frame {k})");
             }
         }

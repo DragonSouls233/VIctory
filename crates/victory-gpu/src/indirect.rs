@@ -12,9 +12,10 @@
 //! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
-//! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! groups per dimension, in x 2^20 ([`widest`]), and 2^20 per dispatch,
+//! one-dimensional mesh dispatches, the budget) cut legitimate work beyond
+//! them; raise them if the title needs more. A slot the title has not
+//! filled (all ones) is no work of its: it runs empty and charges nothing.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -40,8 +41,19 @@ uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = args.Load(at);
+        uint instances = args.Load(at + 4);
+        // A slot the title has not filled holds all ones: it is no draw of
+        // the title's. It runs empty and charges nothing, so the records
+        // after it still run (a clamped one charges a quarter of the
+        // budget).
+        if (count == 0xffffffffu || instances == 0xffffffffu) {
+            count = 0;
+            instances = 0;
+        } else {
+            count = min(count, 1u << 24);
+            instances = min(instances, (1u << 26) / max(count, 1u));
+        }
         cost = count * instances;
         dest.Store2(at, uint2(count, instances));
         // The rest of the record as it is: first vertex and instance (4 words
@@ -52,9 +64,11 @@ uint clamped(uint at) {
             dest.Store2(at + 8, args.Load2(at + 8));
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = args.Load3(at);
+        // Up to WIDEST groups in x run as asked (`widest`).
+        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
@@ -62,7 +76,15 @@ uint clamped(uint at) {
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        // A record of more groups than a dispatch can run is a slot the
+        // title has not filled (it leaves all ones there): it runs empty
+        // and charges nothing. 65,535 groups of meshlets read through the
+        // garbage beside it read past every buffer.
+        if (g.x > 65535u) {
+            g = uint3(0, 0, 0);
+        } else {
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        }
         cost = g.x * g.y * g.z * 128;
         dest.Store3(at, g);
     }
@@ -140,13 +162,51 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    make_from(device, SOURCE)
+}
+
+/// The most groups in x that an indirect dispatch runs as the title asks:
+/// 65,535 is the most D3D12 names for a dispatch, 2^20 what is bounded
+/// here anyway (`VICTORY_INDIRECT_WIDE=0`: 65,535; a record that asks for
+/// more still runs 65,535).
+///
+/// The title's tile lists are dispatches of one group per tile: two of
+/// them are classes of the picture's 8x4 tiles, 115,200 in all at
+/// 2560x1440, and in a captured frame 67,440 and 47,760. Cut to 65,535
+/// the first list lost its last 1,905 tiles, the lowest of the picture.
+/// The console runs what it is asked (its dispatch counts are 32 bits),
+/// and so does an AMD card, whose dispatch packets and group numbers are
+/// the same; D3D12 does not look at indirect counts. Other cards stay at
+/// 65,535.
+fn widest(amd: bool) -> u32 {
+    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
+    if amd && on { 1 << 20 } else { 65_535 }
+}
+
+/// Whether `device` is an AMD card's.
+fn amd(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+    };
+    // SAFETY: plain queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002)
+    }
+}
+
+/// The clamp compiled from `source` (ours).
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    let source = &format!("#define WIDEST {}u\n{source}", widest(amd(device)));
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -313,17 +373,49 @@ mod tests {
         }
     }
 
-    /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
-    /// vertex instances each once clamped) two run, where a wrapping add
-    /// let four; of 600 garbage mesh dispatches 16, not 31.
+    /// Unfilled records (all ones) run empty and charge nothing, so that
+    /// the records after them still run: a clamped one charges a quarter
+    /// of the budget (2^26 vertex instances), and two of them ended it.
     #[test]
-    fn rejected_records_do_not_wrap_the_budget() {
+    fn unfilled_records_run_empty_and_charge_nothing() {
         let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
             return; // no host GPU here
         };
-        assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
+        assert!(draws.iter().all(|&count| count == 0), "unfilled draws run empty");
         let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
-        assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
+        assert!(meshes.iter().all(|&groups| groups == 0), "unfilled mesh dispatches run empty");
+    }
+
+    /// The budget does not wrap: of 128 dear draws (2^26 vertex instances
+    /// each) two run, where a wrapping add let four.
+    #[test]
+    fn dear_records_do_not_wrap_the_budget() {
+        let Some(draws) = clamped(0, &[1 << 24, 4, 0, 0], 128, 1) else {
+            return; // no host GPU here
+        };
+        assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
+    }
+
+    /// An AMD card runs an indirect dispatch of more than 65,535 groups as
+    /// the title asks: its tile lists are one group per tile, and cut to
+    /// 65,535 a list of 67,440 lost its last 1,905 tiles, the lowest of
+    /// the picture ([`widest`]). Other cards run 65,535, and a record
+    /// asking for more than any card runs falls back to 65,535.
+    #[test]
+    fn a_wide_indirect_dispatch_runs_whole_on_amd() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let widest = super::widest(super::amd(&host.device));
+        let Some(groups) = clamped(2, &[70_000, 1, 1], 1, 1) else {
+            return;
+        };
+        assert_eq!(groups[0], if 70_000 <= widest { 70_000 } else { 65_535 });
+        // More than any card runs in x falls back to 65,535.
+        let Some(many) = clamped(2, &[(1 << 20) + 1, 1, 1], 1, 1) else {
+            return;
+        };
+        assert_eq!(many[0], 65_535);
     }
 
     /// The budget goes to the first records, in order: of 200 draws of

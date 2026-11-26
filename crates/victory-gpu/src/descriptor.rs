@@ -197,7 +197,7 @@ pub(crate) fn sync_heaps() {
                     crate::copystat::C::SyncSlots,
                     last.saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last as u32, start, step);
+                host.sync_slots(first as u32, last as u32, start, step, Some((&page_bytes, page as u64)));
             }
         }
     }

@@ -72,9 +72,63 @@ impl Staging {
 /// subresource's bytes (tracked).
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
-    hashes: Vec<Option<blake3::Hash>>,
+    hash: Option<Digest>,
+    hashes: Vec<Option<Digest>>,
 }
+
+/// A content hash of a texture's memory, to tell a changed texture from
+/// an unchanged one.
+///
+/// Not a cryptographic one: blake3 took 0.2 ms a megabyte, four times the
+/// detiling it was to spare, and a world frame hashes hundreds of
+/// megabytes. This one takes 0.035 ms a megabyte. Nobody makes up textures
+/// to collide.
+pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    const K: [u64; 8] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+        0x1d8e_4e27_c47d_124f,
+        0xeb44_acca_b455_d165,
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+    ];
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let word = |b: &[u8]| {
+        let mut w = [0; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut lanes = [K[0], K[1], K[2], K[3]];
+    let mut step = |block: &[u8; 64]| {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let a = word(&block[16 * i..16 * i + 8]);
+            let b = word(&block[16 * i + 8..16 * i + 16]);
+            // (What went in is added again: a product with a factor of zero
+            // forgets neither the lane nor the block.)
+            *lane = fold(a ^ K[4 + i], b ^ *lane).wrapping_add(a.rotate_left(23) ^ lane.rotate_left(41)) ^ b;
+        }
+    };
+    let (blocks, rest) = bytes.as_chunks::<64>();
+    for block in blocks {
+        step(block);
+    }
+    let mut last = [0u8; 64];
+    last[..rest.len()].copy_from_slice(rest);
+    step(&last);
+    let len = bytes.len() as u64;
+    let low = fold(lanes[0] ^ K[1], lanes[1] ^ len) ^ fold(lanes[2] ^ K[3], lanes[3] ^ K[5]);
+    let high = fold(lanes[0].rotate_left(32) ^ K[6], lanes[2] ^ len) ^ fold(lanes[1].rotate_left(32) ^ K[7], lanes[3] ^ K[2]);
+    Digest(u128::from(low) << 64 | u128::from(high))
+}
+
+/// See [`digest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Digest(u128);
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
@@ -618,7 +672,7 @@ impl Staging {
                         last.hashes[i] = None;
                         return true;
                     }
-                    let hash = blake3::hash(&read[a..b]);
+                    let hash = digest(&read[a..b]);
                     last.hashes[i].replace(hash) != Some(hash)
                 })
                 .map(|i| i as u32)
@@ -652,12 +706,12 @@ impl Staging {
             let zeros = vec![0u8; size];
             let every = all();
             let buffer = self.detile(&zeros, &every);
-            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            last.hash = buffer.is_some().then(|| digest(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -884,5 +938,27 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    /// The digest tells a changed texture from an unchanged one: the same
+    /// bytes hash the same, a changed byte hashes differently, and the
+    /// length counts.
+    #[test]
+    fn the_digest_tells_changed_bytes_from_unchanged() {
+        let bytes = vec![7u8; 4096];
+        assert_eq!(digest(&bytes), digest(&bytes));
+        let mut changed = bytes.clone();
+        changed[2000] ^= 1;
+        assert_ne!(digest(&bytes), digest(&changed));
+        // A byte at the end counts as much as one in the middle.
+        let mut at_end = bytes.clone();
+        at_end[4095] ^= 1;
+        assert_ne!(digest(&bytes), digest(&at_end));
+        // The length counts: the same bytes with one more are different.
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_ne!(digest(&bytes), digest(&longer));
+        // Empty is not the same as one zero byte.
+        assert_ne!(digest(&[]), digest(&[0u8; 1]));
     }
 }

@@ -684,11 +684,43 @@ impl HostHeap {
     /// differs from what the slot holds, the rest passed by as `mirror`
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
-    pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+    ///
+    /// The records come from `bytes` (the page read through the kernel by
+    /// `super::sync_heaps`, at the address given with them) where they lie
+    /// wholly in it, and are read in place where they do not (the ones at
+    /// the edges of the range). Reading them in place would fault on a page
+    /// the title unmapped while the sync ran; a world frame reads ~700,000
+    /// of them that way.
+    pub(crate) fn sync_slots(
+        &self,
+        first: u32,
+        last: u32,
+        start: u64,
+        step: u64,
+        bytes: Option<(&[u8], u64)>,
+    ) {
         let at = |i: u32| start + u64::from(i) * step;
-        // SAFETY: records in title heap memory the caller found mapped.
-        let records: Vec<[u32; 3]> =
-            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
+        let mut covered: Vec<Option<[u8; 12]>> = Vec::new();
+        let records: Vec<[u32; 3]> = (first..last)
+            .map(|i| {
+                let addr = at(i);
+                let whole = bytes.and_then(|(bytes, at)| {
+                    let off = addr.checked_sub(at)? as usize;
+                    <[u8; 12]>::try_from(bytes.get(off..off + 12)?).ok()
+                });
+                let Some(bytes) = whole else {
+                    covered.push(None);
+                    // SAFETY: records in title heap memory the caller found
+                    // mapped.
+                    return unsafe { (addr as *const [u32; 3]).read_unaligned() };
+                };
+                covered.push(Some(bytes));
+                let word = |k: usize| {
+                    u32::from_le_bytes(bytes[k * 4..k * 4 + 4].try_into().unwrap_or([0; 4]))
+                };
+                [word(0), word(1), word(2)]
+            })
+            .collect();
         let current = views_current(&records);
         let stale: Vec<u32> = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -703,7 +735,14 @@ impl HostHeap {
                 .collect()
         };
         for i in stale {
-            self.mirror(i, at(i), false);
+            match covered[(i - first) as usize] {
+                Some(bytes) => {
+                    self.mirror_from(i, at(i), false, Some(&bytes));
+                }
+                None => {
+                    self.mirror(i, at(i), false);
+                }
+            }
         }
     }
 
@@ -2083,12 +2122,22 @@ mod tests {
 
     /// A heap sync makes the slots whose records the title changed as bytes
     /// (a copy of another slot's record, a record cleared) and passes the
-    /// others by.
+    /// others by. The records come from the page's bytes the sync read
+    /// through the kernel where they lie wholly in them, and are read in
+    /// place where they do not: both ways make the same slots.
     #[test]
     fn heap_syncs_make_the_slots_whose_records_changed() {
         if host().is_none() {
             return; // no host GPU here
         }
+        heap_sync(false);
+        heap_sync(true);
+    }
+
+    /// A heap sync over slots `0..4` of a heap of its own, with the
+    /// records read in place (`from_bytes` false) or from the bytes of
+    /// the page (true).
+    fn heap_sync(from_bytes: bool) {
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
         let mut heap = null;
@@ -2101,14 +2150,34 @@ mod tests {
         // heap guarded read-only hung the suite).
         crate::descriptor::create_cbv(null, &[0, 0, 256, 0], start);
         let host = title_heap.host().expect("a host view heap");
+        // The page's bytes, as the kernel read them.
+        let page = || -> Vec<u8> {
+            let mut bytes = vec![0u8; 4 * 32];
+            // SAFETY: the heap's memory, read into our own bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(start as *const u8, bytes.as_mut_ptr(), bytes.len());
+            }
+            bytes
+        };
+        let sync = |bytes: Option<&Vec<u8>>| {
+            host.sync_slots(
+                0,
+                4,
+                start,
+                32,
+                bytes.map(|bytes| (bytes.as_slice(), start)),
+            );
+        };
         // SAFETY: slots 0 and 1 of the heap's memory, 32 bytes each.
         unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
         assert!(!host.made(1), "copied as bytes: not seen yet");
-        host.sync_slots(0, 4, start, 32);
+        let bytes = page();
+        sync(if from_bytes { Some(&bytes) } else { None });
         assert!(host.made(0) && host.made(1) && !host.made(2));
         // SAFETY: as above.
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
-        host.sync_slots(0, 4, start, 32);
+        let bytes = page();
+        sync(if from_bytes { Some(&bytes) } else { None });
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
     }
 

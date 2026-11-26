@@ -1553,6 +1553,30 @@ pub(crate) const IDLE_MS: u64 = 120_000;
 /// card's budget does.
 #[cfg(windows)]
 pub(crate) const IDLE_FRAMES: u64 = 300;
+/// How long a host texture fed from title memory may stay unused, by how
+/// much of the card's memory budget is used: the fuller it is, the sooner
+/// an unused one goes, so that a texture in use is not given up to make
+/// room (the fork's `vram_idle_for`).
+///
+/// At a low pressure the idle time decides (two minutes, measured: of the
+/// textures given up after 20 s, nine in ten were read again within a
+/// minute, run evict4). As the card fills, an unused texture goes sooner
+/// than one in use, and only then the least recently used ones.
+#[cfg(windows)]
+fn idle_limits(used_pct: u64) -> (u64, u64) {
+    const LONG_MS: u64 = 30_000;
+    const LONG_FRAMES: u64 = 75;
+    const MODERATE_MS: u64 = 2_500;
+    const MODERATE_FRAMES: u64 = 8;
+    const HIGH_MS: u64 = 1_000;
+    const HIGH_FRAMES: u64 = 3;
+    match used_pct {
+        85.. => (HIGH_MS, HIGH_FRAMES),
+        75..=84 => (MODERATE_MS, MODERATE_FRAMES),
+        68..=74 => (LONG_MS, LONG_FRAMES),
+        _ => (IDLE_MS, IDLE_FRAMES),
+    }
+}
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
 const NEVER: u64 = u64::MAX;
@@ -1610,13 +1634,15 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+    let (over, used_pct) = crate::host::video_memory().map_or((0, 0), |[(used, budget), _]| {
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
+        let pct = if budget > 0.0 { (used / budget * 100.0) as u64 } else { 0 };
+        let over = if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 };
+        (over, pct)
     });
-    evict(frame, now_ms(), over);
+    evict(frame, now_ms(), over, used_pct);
 }
 
 /// A host texture and the title textures (resource objects) holding it.
@@ -1628,12 +1654,12 @@ pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 /// then least recently used ones until `over` bytes are gone
 /// ([`give_up`]). Returns how many and their bytes.
 #[cfg(windows)]
-fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
+fn evict(frame: u64, now: u64, over: u64, used_pct: u64) -> (u64, u64) {
     // Read through the heap since the last pass: used (a slot's read mark is
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
     let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
+    evict_among(&candidates(), &read, frame, now, over, idle_limits(used_pct))
 }
 
 /// [`evict`] among `candidates`, with `read` (raw pointers) the host
@@ -1645,6 +1671,7 @@ pub(crate) fn evict_among(
     frame: u64,
     now: u64,
     over: u64,
+    idle: (u64, u64),
 ) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     for (t, _) in candidates {
@@ -1654,7 +1681,7 @@ pub(crate) fn evict_among(
     }
     let uses: Vec<(u64, u64, u64)> =
         candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
-    let chosen = choose(&uses, frame, now, over);
+    let chosen = choose(&uses, frame, now, over, idle);
     let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
     give_up(&gone, frame)
 }
@@ -1677,8 +1704,11 @@ fn candidates() -> Vec<Owned> {
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
 /// gone (indices).
-fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
-    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
+fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64, idle: (u64, u64)) -> Vec<usize> {
+    let (idle_ms, idle_frames) = idle;
+    let idle = |&(f, ms, _): &(u64, u64, u64)| {
+        frame.saturating_sub(f) >= idle_frames && now.saturating_sub(ms) >= idle_ms
+    };
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
     rest.sort_by_key(|&i| uses[i].1);
@@ -2486,16 +2516,30 @@ mod tests {
     #[test]
     fn idle_textures_go_and_past_the_budget_the_least_recently_used() {
         let (frame, now) = (1_000, 1_000_000);
+        let idle_limits = (IDLE_MS, IDLE_FRAMES);
         let recent = (frame, now - 1_000, 10);
         let idle = (frame - IDLE_FRAMES, now - IDLE_MS, 10);
         let older = (frame, now - 5_000, 30);
         let uses = [recent, idle, older];
-        assert_eq!(choose(&uses, frame, now, 0), vec![1], "idle only");
-        assert_eq!(choose(&uses, frame, now, 10), vec![1], "the idle one covers the excess");
-        assert_eq!(choose(&uses, frame, now, 11), vec![1, 2], "then the least recently used");
-        assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
+        assert_eq!(choose(&uses, frame, now, 0, idle_limits), vec![1], "idle only");
+        assert_eq!(choose(&uses, frame, now, 10, idle_limits), vec![1], "the idle one covers the excess");
+        assert_eq!(choose(&uses, frame, now, 11, idle_limits), vec![1, 2], "then the least recently used");
+        assert_eq!(choose(&uses, frame, now, 1 << 20, idle_limits), vec![1, 2, 0], "all of them if need be");
         let early = (frame - 1, now - IDLE_MS, 10);
-        assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
+        assert!(choose(&[early], frame, now, 0, idle_limits).is_empty(), "too few frames ago");
+    }
+
+    /// The fuller the card's memory, the sooner a texture that has not been
+    /// used is given up: a texture in use is not given up to make room.
+    #[test]
+    fn a_full_card_gives_up_unused_textures_sooner() {
+        assert_eq!(idle_limits(10), (IDLE_MS, IDLE_FRAMES), "room to spare");
+        assert_eq!(idle_limits(70), (30_000, 75));
+        assert_eq!(idle_limits(80), (2_500, 8));
+        assert_eq!(idle_limits(90), (1_000, 3));
+        // The idle time and the frames fall together.
+        assert!(idle_limits(90).0 < idle_limits(80).0 && idle_limits(80).0 < idle_limits(70).0);
+        assert!(idle_limits(90).1 < idle_limits(80).1 && idle_limits(80).1 < idle_limits(70).1);
     }
 
     /// Title textures of one memory share a key in any format of the same
